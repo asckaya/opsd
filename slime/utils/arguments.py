@@ -1332,6 +1332,88 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_opsd_arguments(parser):
+            """Add OPSD specific arguments."""
+            parser.add_argument("--opsd-k", type=int, default=8, help="Number of samples to generate (K)")
+            parser.add_argument("--opsd-n", type=int, default=2, help="Number of privileged traces to select (N)")
+            parser.add_argument(
+                "--opsd-kb", type=int, default=None, help="Number of candidates to keep after quality scoring"
+            )
+            parser.add_argument("--opsd-alpha", type=float, default=1.0, help="OPSD loss weight")
+            parser.add_argument(
+                "--opsd-kl-weight", type=float, default=1.0, help="Mixture weight: KL coefficient (beta)"
+            )
+            parser.add_argument(
+                "--opsd-entropy-weight", type=float, default=0.5, help="Mixture weight: Entropy coefficient (gamma)"
+            )
+            parser.add_argument(
+                "--opsd-diversity-weight", type=float, default=0.5, help="Mixture weight: Diversity coefficient (rho)"
+            )
+            parser.add_argument(
+                "--opsd-temperature", type=float, default=1.0, help="Temperature for mixture weight computation"
+            )
+            parser.add_argument(
+                "--opsd-weight-top-k", type=int, default=512, help="Truncate vocab to top-K for mixture weights"
+            )
+            parser.add_argument("--opsd-jsd-token-clip", type=float, default=None, help="Clip JSD per token")
+            parser.add_argument(
+                "--opsd-fallback-to-gt",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Use GT if no correct samples",
+            )
+            parser.add_argument(
+                "--opsd-quality-len-weight",
+                type=float,
+                default=0.1,
+                help="Quality score length penalty weight (eta_l)",
+            )
+            parser.add_argument(
+                "--opsd-quality-format-weight",
+                type=float,
+                default=0.2,
+                help="Quality score format penalty weight (eta_f)",
+            )
+            parser.add_argument(
+                "--opsd-quality-conf-weight",
+                type=float,
+                default=0.5,
+                help="Quality score confidence reward weight (eta_c)",
+            )
+            parser.add_argument(
+                "--opsd-diversity-metric",
+                type=str,
+                choices=["unigram_jsd", "token_jsd"],
+                default="token_jsd",
+                help="Diversity distance for k-center selection",
+            )
+            parser.add_argument(
+                "--opsd-diversity-top-k",
+                type=int,
+                default=128,
+                help="Top-K vocab truncation for token-level JSD diversity",
+            )
+            parser.add_argument(
+                "--opsd-teacher-mode",
+                type=str,
+                choices=["ema", "frozen"],
+                default="frozen",
+                help="Teacher mode: EMA-updated or frozen initial weights",
+            )
+            parser.add_argument(
+                "--opsd-ema-decay",
+                type=float,
+                default=0.999,
+                help="EMA decay for OPSD teacher when opsd-teacher-mode=ema",
+            )
+            parser.add_argument(
+                "--opsd-teacher-chunk-size",
+                type=int,
+                default=8,
+                help="Chunk size for OPSD teacher forward pass (0 disables chunking)",
+            )
+            return parser
+
         def add_mtp_training_arguments(parser):
             """Add MTP training specific arguments."""
             reset_arg(parser, "--mtp-num-layers", type=int, default=None)
@@ -1386,6 +1468,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
         parser = add_mtp_training_arguments(parser)
+        parser = add_opsd_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
         reset_arg(
