@@ -20,7 +20,7 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 HF_CHECKPOINT=${HF_CHECKPOINT:-"/path/to/Qwen3-1.7B"}
 PROMPT_DATA=${PROMPT_DATA:-"data/opsd_math_30k.jsonl"}
 SAVE_DIR=${SAVE_DIR:-"./checkpoints/qwen3-1.7b-opsd"}
-LOAD_DIR=${LOAD_DIR:-"${SAVE_DIR}"}
+LOAD_DIR=${LOAD_DIR:-"${HF_CHECKPOINT}"}
 EVAL_CONFIG_PATH=${EVAL_CONFIG_PATH:-"data/preprocess/test/eval_config.yaml"}
 EVAL_INTERVAL=${EVAL_INTERVAL:-50}
 
@@ -34,6 +34,7 @@ source "scripts/models/qwen3-1.7B.sh"
 CKPT_ARGS=(
    --hf-checkpoint ${HF_CHECKPOINT}
    --load ${LOAD_DIR}
+   --megatron-to-hf-mode bridge
    --save ${SAVE_DIR}
    --save-interval 50
 )
