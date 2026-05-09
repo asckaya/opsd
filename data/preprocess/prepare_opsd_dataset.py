@@ -14,8 +14,6 @@ def prepare_dataset(output_path):
     print(f"Converting to slime format and saving to {output_path}...")
     with open(output_path, "w", encoding="utf-8") as f:
         for example in ds:
-            # slime expects a 'prompt' key by default, or we can specify --input-key
-            # We also include 'label' which is the ground truth solution
             item = {"prompt": example["problem"], "label": example["solution"]}
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 

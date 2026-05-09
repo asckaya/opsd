@@ -20,10 +20,12 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 HF_CHECKPOINT=${HF_CHECKPOINT:-"/path/to/Qwen3-1.7B"}
 PROMPT_DATA=${PROMPT_DATA:-"data/opsd_math_30k.jsonl"}
 SAVE_DIR=${SAVE_DIR:-"./checkpoints/qwen3-1.7b-opsd"}
+EVAL_CONFIG_PATH=${EVAL_CONFIG_PATH:-"data/preprocess/test/eval_config.yaml"}
+EVAL_INTERVAL=${EVAL_INTERVAL:-50}
 
 # Environment setup
 export PYTHONPATH=$PYTHONPATH${PYTHONPATH:+:}.
-# If you haven't prepared the dataset yet, run the prepare_opsd_dataset.py script first.
+# If you haven't prepared the dataset yet, run data/preprocess/prepare_opsd_dataset.py first.
 source "scripts/models/qwen3-1.7B.sh"
 
 # --- Arguments ---
@@ -104,11 +106,22 @@ RM_ARGS=(
    --rm-type math
 )
 
+TB_ARGS=(
+    --use-tensorboard
+    --tb-project-name opsd
+    --tb-experiment-name qwen3-1.7b-opsd
+)
+
 WANDB_ARGS=(
-   # --use-wandb
-   # --wandb-project opsd
-   # --wandb-group qwen3-1.7b-opsd
-   # --wandb-key ${WANDB_KEY}
+    # --use-wandb
+    # --wandb-project opsd
+    # --wandb-group qwen3-1.7b-opsd
+    # --wandb-key ${WANDB_KEY}
+)
+
+EVAL_ARGS=(
+    --eval-interval ${EVAL_INTERVAL}
+    --eval-config ${EVAL_CONFIG_PATH}
 )
 
 SGLANG_ARGS=(
@@ -129,10 +142,10 @@ MISC_ARGS=(
 # Start Ray
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 ray stop --force || true
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8088
 
 # Submit Job
-ray job submit --address="http://127.0.0.1:8265" \
+ray job submit --address="http://127.0.0.1:8088" \
    --runtime-env-json='{"env_vars": {"CUDA_DEVICE_MAX_CONNECTIONS": "1"}}' \
    -- python3 train.py \
    --actor-num-nodes 1 \
@@ -142,13 +155,15 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
    ${OPSD_ARGS[@]} \
-   ${PERF_ARGS[@]} \
-   ${OPTIMIZER_ARGS[@]} \
-   ${RM_ARGS[@]} \
-   ${WANDB_ARGS[@]} \
-   ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]} \
-   --num-rollout 1000
+    ${PERF_ARGS[@]} \
+    ${OPTIMIZER_ARGS[@]} \
+    ${RM_ARGS[@]} \
+    ${EVAL_ARGS[@]} \
+    ${TB_ARGS[@]} \
+    ${WANDB_ARGS[@]} \
+    ${SGLANG_ARGS[@]} \
+    ${MISC_ARGS[@]} \
+    --num-rollout 1000
 
 # Cleanup
 # ray stop --force
