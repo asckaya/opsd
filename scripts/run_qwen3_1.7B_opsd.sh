@@ -5,6 +5,16 @@
 
 set -ex
 
+export PYTHONBUFFERED=16
+
+NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+if [ "$NVLINK_COUNT" -gt 0 ]; then
+    HAS_NVLINK=1
+else
+    HAS_NVLINK=0
+fi
+echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
+
 # --- Configuration ---
 # Path to the Qwen3-1.7B checkpoint and data
 HF_CHECKPOINT=${HF_CHECKPOINT:-"/path/to/Qwen3-1.7B"}
@@ -27,6 +37,7 @@ CKPT_ARGS=(
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_DATA}
    --input-key prompt
+   --label-key label
    --apply-chat-template
    --rollout-shuffle
    --rollout-batch-size 16
@@ -56,15 +67,26 @@ OPSD_ARGS=(
    --opsd-diversity-weight 0.5 # Mixture weight Diversity coeff (rho)
    --opsd-temperature 1.0     # Temperature for mixture weights
    --opsd-weight-top-k 512    # Efficiency: truncate vocab for weights
+   --opsd-diversity-top-k 128 # Top-K vocab truncation for token-level JSD
+   --opsd-teacher-mode ema
+   --opsd-ema-decay 0.999
+   --opsd-teacher-chunk-size 8
 )
 
 # Performance & Parallelism
 PERF_ARGS=(
    --tensor-model-parallel-size 1
+   --sequence-parallel
    --pipeline-model-parallel-size 1
+   --context-parallel-size 1
+   --expert-model-parallel-size 1
+   --expert-tensor-parallel-size 1
    --micro-batch-size 1
    --use-dynamic-batch-size
    --max-tokens-per-gpu 8192
+   --recompute-granularity full
+   --recompute-method uniform
+   --recompute-num-layers 1
    --attention-backend flash
 )
 
@@ -74,13 +96,40 @@ OPTIMIZER_ARGS=(
    --lr 1e-6
    --lr-decay-style constant
    --weight-decay 0.1
+   --adam-beta1 0.9
+   --adam-beta2 0.98
+)
+
+RM_ARGS=(
+   --rm-type math
+)
+
+WANDB_ARGS=(
+   # --use-wandb
+   # --wandb-project opsd
+   # --wandb-group qwen3-1.7b-opsd
+   # --wandb-key ${WANDB_KEY}
+)
+
+SGLANG_ARGS=(
+   --rollout-num-gpus-per-engine 1
+   --sglang-mem-fraction-static 0.4
+)
+
+MISC_ARGS=(
+   --attention-dropout 0.0
+   --hidden-dropout 0.0
+   --accumulate-allreduce-grads-in-fp32
+   --attention-softmax-in-fp32
+   --attention-backend flash
 )
 
 # --- Execution ---
 
 # Start Ray
+export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 ray stop --force || true
-ray start --head --num-gpus 8 --disable-usage-stats
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 # Submit Job
 ray job submit --address="http://127.0.0.1:8265" \
@@ -95,6 +144,10 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${OPSD_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
+   ${RM_ARGS[@]} \
+   ${WANDB_ARGS[@]} \
+   ${SGLANG_ARGS[@]} \
+   ${MISC_ARGS[@]} \
    --num-rollout 1000
 
 # Cleanup
