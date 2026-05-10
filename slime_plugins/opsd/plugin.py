@@ -163,14 +163,12 @@ class OPSDPlugin(metaclass=SingletonMeta):
         if not correct:
             return [], []
 
-        self._teachers.attach_confidence(args, correct)
+        # Rollout keeps only the lightweight structural score; confidence is
+        # added later on the training side with the teacher already in memory.
         scored = [
             OPSDTrace(tokens=self._get_response_tokens(sample), score=self._score_trace(args, sample))
             for sample in correct
         ]
-        if opsd_kb is None or opsd_kb <= 0:
-            opsd_kb = min(len(scored), max(opsd_n * 2, 1))
-        scored = self._top_kb(scored, opsd_kb)
         return [trace.tokens for trace in scored], [trace.score for trace in scored]
 
     def _score_trace(self, args, sample) -> float:
@@ -180,8 +178,6 @@ class OPSDPlugin(metaclass=SingletonMeta):
         score -= args.opsd_quality_len_weight * (resp_len / max_len)
         if "\\boxed{" not in sample.response:
             score -= args.opsd_quality_format_weight
-        if sample.teacher_log_probs:
-            score += args.opsd_quality_conf_weight * float(np.mean(sample.teacher_log_probs))
         return score
 
     def _top_kb(self, traces: list[OPSDTrace], k_b: int) -> list[OPSDTrace]:
@@ -365,10 +361,28 @@ class OPSDPlugin(metaclass=SingletonMeta):
             teacher_logits_i = self._forward_teacher(sample_inputs, num_logits_to_keep=resp_len)
             teacher_slice = teacher_logits_i[:, -resp_len:]
 
-            selected = self._select_diverse_indices(
+            # Add confidence on the training side so rollout does not need to
+            # load a separate teacher instance.
+            candidate_scores_i = self._apply_confidence_scores(
                 args,
                 candidate_scores[i],
-                candidate_tokens[i],
+                teacher_slice,
+                batch["unconcat_tokens"][i][-resp_len:],
+            )
+
+            k_b = args.opsd_kb
+            if k_b is not None and k_b > 0 and len(candidate_scores_i) > k_b:
+                top_idx = np.argsort(np.array(candidate_scores_i))[-k_b:].tolist()
+                candidate_scores_i = [candidate_scores_i[j] for j in top_idx]
+                candidate_tokens_i = [candidate_tokens[i][j] for j in top_idx]
+                teacher_slice = teacher_slice[top_idx]
+            else:
+                candidate_tokens_i = candidate_tokens[i]
+
+            selected = self._select_diverse_indices(
+                args,
+                candidate_scores_i,
+                candidate_tokens_i,
                 teacher_slice,
             )
             if not selected:
@@ -391,6 +405,24 @@ class OPSDPlugin(metaclass=SingletonMeta):
         if valid == 0:
             return total_kl
         return total_kl / valid
+
+    def _apply_confidence_scores(
+        self,
+        args,
+        base_scores: list[float],
+        teacher_slice: torch.Tensor,
+        response_tokens: torch.Tensor,
+    ) -> list[float]:
+        if not base_scores:
+            return []
+
+        log_probs = F.log_softmax(teacher_slice, dim=-1)
+        target = response_tokens.to(device=teacher_slice.device, dtype=torch.long).unsqueeze(0).unsqueeze(-1)
+        token_log_probs = log_probs.gather(-1, target.expand(log_probs.size(0), -1, -1)).squeeze(-1)
+        conf_scores = token_log_probs.mean(dim=-1)
+
+        conf_weight = args.opsd_quality_conf_weight
+        return [base + conf_weight * float(conf.item()) for base, conf in zip(base_scores, conf_scores, strict=False)]
 
     def _extract_student_responses(self, logits, batch) -> list[torch.Tensor]:
         return [

@@ -13,7 +13,7 @@ This plugin implements the **Diverse Self-Privileged OPSD** algorithm, which lev
 ## Components
 
 - `plugin.py`: Rollout selection, hook wiring, and mixture-teacher loss.
-- `teacher.py`: Lazy teacher loading, rollout confidence scoring, and optional EMA updates.
+- `teacher.py`: Lazy training-teacher loading and optional EMA updates.
 
 ## Usage
 
@@ -47,7 +47,7 @@ Key arguments:
 --opsd-fallback-to-gt          # Use GT traces if no correct self-generated traces
 --opsd-quality-len-weight 0.1  # Quality length penalty weight (eta_l)
 --opsd-quality-format-weight 0.2 # Quality format penalty weight (eta_f)
---opsd-quality-conf-weight 0.5 # Quality confidence reward weight (eta_c)
+--opsd-quality-conf-weight 0.5 # Confidence weight; computed on the training side
 --opsd-diversity-metric token_jsd # Diversity distance for k-center selection
 --opsd-diversity-top-k 128      # Top-K vocab truncation for token-level JSD
 --opsd-teacher-mode ema         # Teacher mode: ema or frozen

@@ -3,19 +3,16 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 
 class OPSDTeacherManager:
-    """Lazily manage rollout and training teachers for OPSD.
+    """Lazily manage the training teacher for OPSD.
 
-    The rollout teacher is used to compute confidence scores for successful traces.
     The training teacher is used for mixture-teacher distillation and may be EMA-updated.
     """
 
     def __init__(self) -> None:
         self._training_teacher = None
-        self._rollout_teacher = None
         self._bridge = None
 
     @staticmethod
@@ -48,45 +45,10 @@ class OPSDTeacherManager:
     def training_teacher(self):
         return self._training_teacher
 
-    @property
-    def rollout_teacher(self):
-        return self._rollout_teacher
-
     def ensure_training_teacher(self, args, reference_model=None):
         if self._training_teacher is None:
             self._training_teacher = self._load_hf_teacher(args, reference_model=reference_model)
         return self._training_teacher
-
-    def ensure_rollout_teacher(self, args):
-        if self._rollout_teacher is None:
-            self._rollout_teacher = self._load_hf_teacher(args, reference_model=None)
-        return self._rollout_teacher
-
-    def attach_confidence(self, args, samples) -> None:
-        if not samples:
-            return
-
-        teacher = self.ensure_rollout_teacher(args)
-        device = next(teacher.parameters()).device
-
-        for sample in samples:
-            if sample.teacher_log_probs is not None:
-                continue
-
-            tokens = sample.tokens
-            if len(tokens) <= 1 or sample.response_length <= 0:
-                sample.teacher_log_probs = []
-                continue
-
-            input_ids = torch.tensor(tokens, device=device, dtype=torch.long).unsqueeze(0)
-            with torch.no_grad():
-                logits = teacher(input_ids).logits
-                log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
-                target_tokens = input_ids[:, 1:].unsqueeze(-1)
-                token_log_probs = log_probs.gather(-1, target_tokens).squeeze(-1)
-
-            response_log_probs = token_log_probs[0, -sample.response_length :]
-            sample.teacher_log_probs = response_log_probs.detach().float().cpu().tolist()
 
     def update_ema(self, args, model_chunks) -> None:
         if self._training_teacher is None:
