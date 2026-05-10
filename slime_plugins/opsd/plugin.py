@@ -327,8 +327,9 @@ class OPSDPlugin(metaclass=SingletonMeta):
                 end = min(start + chunk_size, padded.size(0))
                 chunk = self._teachers.training_teacher(padded[start:end], **kwargs).logits
                 if result is None:
-                    result = chunk.new_empty(padded.size(0), *chunk.shape[1:])
-                result[row : row + chunk.size(0)].copy_(chunk)
+                    # Allocate on CPU to save GPU memory
+                    result = torch.empty(padded.size(0), *chunk.shape[1:], dtype=chunk.dtype, device='cpu')
+                result[row : row + chunk.size(0)].copy_(chunk, non_blocking=True)
                 del chunk
                 row += end - start
         return result
@@ -387,7 +388,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
             )
             if not selected:
                 continue
-            teacher_slice = teacher_slice[selected]
+            teacher_slice = teacher_slice[selected].to(student_logits.device)
 
             weights = self._get_mixture_weights(student_logits, teacher_slice)
             q_mix = 0
