@@ -307,22 +307,33 @@ class OPSDPlugin(metaclass=SingletonMeta):
             f"{self._constants.boxed_answer_instruction}"
         )
 
-    def _forward_teacher(self, teacher_inputs: list[torch.Tensor], num_logits_to_keep: int = 0) -> torch.Tensor:
+    def _forward_teacher(
+        self,
+        teacher_inputs: list[torch.Tensor],
+        num_logits_to_keep: int = 0,
+    ) -> torch.Tensor:
         max_len = max(tensor.size(0) for tensor in teacher_inputs)
         pad_id = self._tokenizer.pad_token_id or 0
         padded = torch.stack([F.pad(t, (0, max_len - t.size(0)), value=pad_id) for t in teacher_inputs])
         chunk_size = self._args.opsd_teacher_chunk_size
         kwargs = {"logits_to_keep": num_logits_to_keep} if num_logits_to_keep > 0 else {}
+        torch.cuda.empty_cache()
         if chunk_size == 0 or chunk_size >= padded.size(0):
             with torch.no_grad():
                 return self._teacher_model(padded, **kwargs).logits
 
-        outputs = []
+        result = None
+        row = 0
         with torch.no_grad():
             for start in range(0, padded.size(0), chunk_size):
                 end = min(start + chunk_size, padded.size(0))
-                outputs.append(self._teacher_model(padded[start:end], **kwargs).logits)
-        return torch.cat(outputs, dim=0)
+                chunk = self._teacher_model(padded[start:end], **kwargs).logits
+                if result is None:
+                    result = chunk.new_empty(padded.size(0), *chunk.shape[1:])
+                result[row : row + chunk.size(0)].copy_(chunk)
+                del chunk
+                row += end - start
+        return result
 
     def _ensure_teacher(self, args) -> None:
         if self._teacher_model is not None:
