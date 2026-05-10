@@ -341,7 +341,8 @@ class OPSDPlugin(metaclass=SingletonMeta):
     def _clone_frozen_teacher(self, model):
         import copy
 
-        teacher = copy.deepcopy(model)
+        model_to_copy = model.module if hasattr(model, "module") else model
+        teacher = copy.deepcopy(model_to_copy)
         for param in teacher.parameters():
             param.requires_grad = False
         teacher.eval()
