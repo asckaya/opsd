@@ -13,6 +13,7 @@ This plugin implements the **Diverse Self-Privileged OPSD** algorithm, which lev
 ## Components
 
 - `plugin.py`: Rollout selection, hook wiring, and mixture-teacher loss.
+- `teacher.py`: Lazy teacher loading, rollout confidence scoring, and optional EMA updates.
 
 ## Usage
 

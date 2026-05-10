@@ -18,6 +18,8 @@ from slime.rollout.sglang_rollout import generate_rollout as base_generate_rollo
 from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 
+from .teacher import OPSDTeacherManager
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,8 +54,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
         self._model_chunks = None
         self._tokenizer = None
         self._args = None
-        self._teacher_model = None
-        self._bridge = None
+        self._teachers = OPSDTeacherManager()
 
     def _ensure_tokenizer(self, args) -> None:
         if self._tokenizer is None:
@@ -68,9 +69,9 @@ class OPSDPlugin(metaclass=SingletonMeta):
 
     def before_train_step_hook(self, args, rollout_id, step_id, model, optimizer, opt_param_scheduler) -> None:
         self._set_model(model)
-        self._ensure_teacher(args)
+        self._teachers.ensure_training_teacher(args, reference_model=self._model)
         if args.opsd_teacher_mode == "ema":
-            self._update_ema_teacher(args)
+            self._teachers.update_ema(args, self._model_chunks)
 
     def generate_rollout(self, args, rollout_id, data_source, evaluation=False):
         self._ensure_tokenizer(args)
@@ -109,13 +110,13 @@ class OPSDPlugin(metaclass=SingletonMeta):
     def loss_function(self, args, batch, logits, sum_of_sample_mean):
         self._args = args
         self._ensure_tokenizer(args)
-        self._ensure_teacher(args)
+        self._teachers.ensure_training_teacher(args, reference_model=self._model)
 
         base_loss, metrics = policy_loss_function(args, batch, logits, sum_of_sample_mean)
 
         if not self._model:
             return base_loss, metrics
-        if not self._teacher_model:
+        if not self._teachers.training_teacher:
             return base_loss, metrics
 
         metadata_list = batch.get("metadata")
@@ -162,6 +163,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
         if not correct:
             return [], []
 
+        self._teachers.attach_confidence(args, correct)
         scored = [
             OPSDTrace(tokens=self._get_response_tokens(sample), score=self._score_trace(args, sample))
             for sample in correct
@@ -178,8 +180,8 @@ class OPSDPlugin(metaclass=SingletonMeta):
         score -= args.opsd_quality_len_weight * (resp_len / max_len)
         if "\\boxed{" not in sample.response:
             score -= args.opsd_quality_format_weight
-        if sample.rollout_log_probs:
-            score += args.opsd_quality_conf_weight * float(np.mean(sample.rollout_log_probs))
+        if sample.teacher_log_probs:
+            score += args.opsd_quality_conf_weight * float(np.mean(sample.teacher_log_probs))
         return score
 
     def _top_kb(self, traces: list[OPSDTrace], k_b: int) -> list[OPSDTrace]:
@@ -320,62 +322,20 @@ class OPSDPlugin(metaclass=SingletonMeta):
         torch.cuda.empty_cache()
         if chunk_size == 0 or chunk_size >= padded.size(0):
             with torch.no_grad():
-                return self._teacher_model(padded, **kwargs).logits
+                return self._teachers.training_teacher(padded, **kwargs).logits
 
         result = None
         row = 0
         with torch.no_grad():
             for start in range(0, padded.size(0), chunk_size):
                 end = min(start + chunk_size, padded.size(0))
-                chunk = self._teacher_model(padded[start:end], **kwargs).logits
+                chunk = self._teachers.training_teacher(padded[start:end], **kwargs).logits
                 if result is None:
                     result = chunk.new_empty(padded.size(0), *chunk.shape[1:])
                 result[row : row + chunk.size(0)].copy_(chunk)
                 del chunk
                 row += end - start
         return result
-
-    def _ensure_teacher(self, args) -> None:
-        if self._teacher_model is not None:
-            return
-        if self._model is None:
-            return
-        self._teacher_model = self._load_hf_teacher(args)
-
-    def _load_hf_teacher(self, args):
-        from transformers import AutoModelForCausalLM
-
-        ref_param = next(self._model.parameters())
-        teacher = AutoModelForCausalLM.from_pretrained(
-            args.hf_checkpoint,
-            torch_dtype=ref_param.dtype,
-            trust_remote_code=True,
-        )
-        teacher = teacher.to(ref_param.device)
-        for param in teacher.parameters():
-            param.requires_grad = False
-        teacher.eval()
-        return teacher
-
-    def _update_ema_teacher(self, args) -> None:
-        from megatron.bridge import AutoBridge
-        from slime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config, patch_megatron_model
-
-        if self._bridge is None:
-            self._bridge = patch_auto_bridge_hf_config(
-                AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
-            )
-
-        decay = args.opsd_ema_decay
-        teacher_params = dict(self._teacher_model.named_parameters())
-        with patch_megatron_model(self._model_chunks):
-            for hf_tuple in self._bridge.export_hf_weights(self._model_chunks, cpu=False, show_progress=False):
-                t_param = teacher_params.get(hf_tuple.param_name)
-                if t_param is None:
-                    continue
-                with torch.no_grad():
-                    current = hf_tuple.weight.to(t_param.device, dtype=t_param.dtype)
-                    t_param.mul_(decay).add_(current, alpha=1.0 - decay)
 
     def _compute_opsd_kl(
         self,
