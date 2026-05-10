@@ -120,18 +120,23 @@ class OPSDTeacherManager:
             torch.cuda.empty_cache()
             with torch.no_grad():
                 result = self._training_teacher(padded, **kwargs).logits
-            # shape info for broadcast
-            shape = torch.tensor(list(result.shape), dtype=torch.long, device=result.device)
+            result = result.contiguous()
+            # Encode shape + dtype index in a single int64 vector: [B, seq, vocab, dtype_id]
+            # dtype_id: 0=float32, 1=bfloat16, 2=float16
+            _DTYPE_TO_ID = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
+            dtype_id = _DTYPE_TO_ID.get(result.dtype, 0)
+            shape = torch.tensor([*result.shape, dtype_id], dtype=torch.long, device=result.device)
         else:
             result = None
-            shape = torch.zeros(3, dtype=torch.long, device=device)
+            shape = torch.zeros(4, dtype=torch.long, device=device)
 
-        # --- broadcast shape, then data ---
+        # --- broadcast shape+dtype, then data ---
         if tp_world_size > 1:
             torch.distributed.broadcast(shape, src=src_rank, group=tp_group)
             if tp_rank != 0:
-                # allocate receive buffer with the dtype of the teacher (bfloat16)
-                result = torch.empty(shape.tolist(), dtype=torch.bfloat16, device=device)
+                _ID_TO_DTYPE = {0: torch.float32, 1: torch.bfloat16, 2: torch.float16}
+                recv_dtype = _ID_TO_DTYPE.get(int(shape[3].item()), torch.bfloat16)
+                result = torch.empty(shape[:3].tolist(), dtype=recv_dtype, device=device)
             torch.distributed.broadcast(result, src=src_rank, group=tp_group)
 
         return result
