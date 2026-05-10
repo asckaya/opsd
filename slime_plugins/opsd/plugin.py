@@ -390,7 +390,9 @@ class OPSDPlugin(metaclass=SingletonMeta):
             teacher_slice = teacher_slice[selected]
 
             weights = self._get_mixture_weights(student_logits, teacher_slice)
-            q_mix = (weights.unsqueeze(-1) * F.softmax(teacher_slice, dim=-1)).sum(0)
+            q_mix = 0
+            for j in range(teacher_slice.size(0)):
+                q_mix = q_mix + weights[j].unsqueeze(-1) * F.softmax(teacher_slice[j], dim=-1)
             kl = (q_mix * (q_mix.clamp(min=1e-10).log() - F.log_softmax(student_logits, dim=-1))).sum(-1)
 
             if args.opsd_jsd_token_clip is not None:
@@ -416,10 +418,13 @@ class OPSDPlugin(metaclass=SingletonMeta):
         if not base_scores:
             return []
 
-        log_probs = F.log_softmax(teacher_slice, dim=-1)
-        target = response_tokens.to(device=teacher_slice.device, dtype=torch.long).unsqueeze(0).unsqueeze(-1)
-        token_log_probs = log_probs.gather(-1, target.expand(log_probs.size(0), -1, -1)).squeeze(-1)
-        conf_scores = token_log_probs.mean(dim=-1)
+        target = response_tokens.to(device=teacher_slice.device, dtype=torch.long).unsqueeze(-1)
+        conf_scores = []
+        for i in range(teacher_slice.size(0)):
+            target_logits_i = teacher_slice[i].gather(-1, target).squeeze(-1)
+            log_Z_i = torch.logsumexp(teacher_slice[i], dim=-1)
+            token_log_probs_i = target_logits_i - log_Z_i
+            conf_scores.append(token_log_probs_i.mean(dim=-1))
 
         conf_weight = args.opsd_quality_conf_weight
         return [base + conf_weight * float(conf.item()) for base, conf in zip(base_scores, conf_scores, strict=False)]
@@ -442,14 +447,11 @@ class OPSDPlugin(metaclass=SingletonMeta):
         top_k = min(self._args.opsd_weight_top_k, vocab)
 
         student_scaled = student_logits / temp
-        teacher_scaled = teacher_logits / temp
         _, idx = torch.topk(student_scaled, k=top_k, dim=-1)
 
-        student_log = F.log_softmax(torch.gather(student_scaled, -1, idx), dim=-1)
-        teacher_log = F.log_softmax(
-            torch.gather(teacher_scaled, -1, idx.unsqueeze(0).expand(num_refs, -1, -1)),
-            dim=-1,
-        )
+        student_log = F.log_softmax(torch.gather(student_logits, -1, idx) / temp, dim=-1)
+        teacher_gathered = torch.gather(teacher_logits, -1, idx.unsqueeze(0).expand(num_refs, -1, -1))
+        teacher_log = F.log_softmax(teacher_gathered / temp, dim=-1)
         teacher_prob = teacher_log.exp()
 
         delta = (teacher_prob * (teacher_log - student_log.unsqueeze(0))).sum(-1).clamp(min=0)
