@@ -134,7 +134,8 @@ class OPSDPlugin(metaclass=SingletonMeta):
         if not teacher_inputs:
             return base_loss, metrics
 
-        teacher_logits = self._forward_teacher(teacher_inputs)
+        num_logits_to_keep = int(max(batch["response_lengths"]))
+        teacher_logits = self._forward_teacher(teacher_inputs, num_logits_to_keep=num_logits_to_keep)
         opsd_kl = self._compute_opsd_kl(
             args,
             batch,
@@ -308,22 +309,21 @@ class OPSDPlugin(metaclass=SingletonMeta):
             f"{self._constants.boxed_answer_instruction}"
         )
 
-    def _forward_teacher(self, teacher_inputs: list[torch.Tensor]) -> torch.Tensor:
+    def _forward_teacher(self, teacher_inputs: list[torch.Tensor], num_logits_to_keep: int = 0) -> torch.Tensor:
         max_len = max(tensor.size(0) for tensor in teacher_inputs)
         pad_id = self._tokenizer.pad_token_id or 0
         padded = torch.stack([F.pad(t, (0, max_len - t.size(0)), value=pad_id) for t in teacher_inputs])
         chunk_size = self._args.opsd_teacher_chunk_size
+        kwargs = {"num_logits_to_keep": num_logits_to_keep} if num_logits_to_keep > 0 else {}
         if chunk_size == 0 or chunk_size >= padded.size(0):
             with torch.no_grad():
-                output = self._teacher_model(padded)
-                return output.logits
+                return self._teacher_model(padded, **kwargs).logits
 
         outputs = []
         with torch.no_grad():
             for start in range(0, padded.size(0), chunk_size):
                 end = min(start + chunk_size, padded.size(0))
-                output = self._teacher_model(padded[start:end])
-                outputs.append(output.logits)
+                outputs.append(self._teacher_model(padded[start:end], **kwargs).logits)
         return torch.cat(outputs, dim=0)
 
     def _ensure_teacher(self, args) -> None:
