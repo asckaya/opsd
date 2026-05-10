@@ -52,7 +52,6 @@ class OPSDPlugin(metaclass=SingletonMeta):
         self._tokenizer = None
         self._args = None
         self._teacher_model = None
-        self._ema_state = None
 
     def _ensure_tokenizer(self, args) -> None:
         if self._tokenizer is None:
@@ -329,42 +328,35 @@ class OPSDPlugin(metaclass=SingletonMeta):
             return
         if self._model is None:
             return
+        self._teacher_model = self._load_hf_teacher(args)
 
-        if args.opsd_teacher_mode == "ema":
-            self._teacher_model = self._clone_frozen_teacher(self._model)
-            self._ema_state = {name: param.detach().clone() for name, param in self._model.named_parameters()}
-            self._apply_ema_to_teacher()
-            return
+    def _load_hf_teacher(self, args):
+        from transformers import AutoModelForCausalLM
 
-        self._teacher_model = self._clone_frozen_teacher(self._model)
-
-    def _clone_frozen_teacher(self, model):
-        import copy
-
-        model_to_copy = model.module if hasattr(model, "module") else model
-        teacher = copy.deepcopy(model_to_copy)
+        ref_param = next(self._model.parameters())
+        teacher = AutoModelForCausalLM.from_pretrained(
+            args.hf_checkpoint,
+            torch_dtype=ref_param.dtype,
+            trust_remote_code=True,
+        )
+        teacher = teacher.to(ref_param.device)
         for param in teacher.parameters():
             param.requires_grad = False
         teacher.eval()
         return teacher
 
     def _update_ema_teacher(self, args) -> None:
-        if self._ema_state is None:
-            self._ema_state = {name: param.detach().clone() for name, param in self._model.named_parameters()}
-            return
-
         decay = args.opsd_ema_decay
-        for name, param in self._model.named_parameters():
-            ema_param = self._ema_state[name]
-            ema_param.mul_(decay).add_(param.detach(), alpha=1.0 - decay)
-        self._apply_ema_to_teacher()
-
-    def _apply_ema_to_teacher(self) -> None:
-        if self._teacher_model is None or self._ema_state is None:
-            return
+        model = self._model.module if hasattr(self._model, "module") else self._model
+        megatron_params = list(model.parameters())
+        teacher_params = list(self._teacher_model.parameters())
+        if len(megatron_params) != len(teacher_params):
+            raise ValueError(
+                f"EMA param count mismatch: megatron={len(megatron_params)}, teacher={len(teacher_params)}"
+            )
         with torch.no_grad():
-            for name, param in self._teacher_model.named_parameters():
-                param.copy_(self._ema_state[name])
+            for t_p, m_p in zip(teacher_params, megatron_params):
+                t_p.mul_(decay).add_(m_p.detach(), alpha=1.0 - decay)
 
     def _compute_opsd_kl(
         self,
