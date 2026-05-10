@@ -134,13 +134,11 @@ class OPSDPlugin(metaclass=SingletonMeta):
         if not teacher_inputs:
             return base_loss, metrics
 
-        num_logits_to_keep = int(max(batch["response_lengths"]))
-        teacher_logits = self._forward_teacher(teacher_inputs, num_logits_to_keep=num_logits_to_keep)
         opsd_kl = self._compute_opsd_kl(
             args,
             batch,
             response_logits,
-            teacher_logits,
+            teacher_inputs,
             trace_counts,
             candidate_scores,
             candidate_tokens,
@@ -373,12 +371,13 @@ class OPSDPlugin(metaclass=SingletonMeta):
         args,
         batch,
         response_logits: list[torch.Tensor],
-        teacher_logits: torch.Tensor,
+        teacher_inputs: list[torch.Tensor],
         trace_counts: list[int],
         candidate_scores: list[list[float]],
         candidate_tokens: list[list[list[int]]],
     ) -> torch.Tensor:
-        total_kl = torch.tensor(0.0, device=teacher_logits.device)
+        device = response_logits[0].device
+        total_kl = torch.tensor(0.0, device=device)
         valid = 0
         offset = 0
 
@@ -386,10 +385,14 @@ class OPSDPlugin(metaclass=SingletonMeta):
             if count == 0:
                 continue
 
-            resp_len = batch["response_lengths"][i]
+            resp_len = int(batch["response_lengths"][i])
             student_logits = response_logits[i]
-            teacher_slice = teacher_logits[offset : offset + count, -resp_len:]
+
+            # Forward teacher for this sample's candidates only, then discard logits.
+            sample_inputs = teacher_inputs[offset : offset + count]
             offset += count
+            teacher_logits_i = self._forward_teacher(sample_inputs, num_logits_to_keep=resp_len)
+            teacher_slice = teacher_logits_i[:, -resp_len:]
 
             selected = self._select_diverse_indices(
                 args,
