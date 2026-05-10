@@ -305,26 +305,37 @@ class OPSDPlugin(metaclass=SingletonMeta):
             f"{self._constants.boxed_answer_instruction}"
         )
 
-    def _iter_teacher_chunks(
+    def _iter_teacher_chunks_broadcast(
         self,
         teacher_inputs: list[torch.Tensor],
         num_logits_to_keep: int = 0,
+        device: torch.device | None = None,
     ):
-        """Yield (start_idx, logits_chunk) pairs without ever building the full result tensor."""
-        max_len = max(tensor.size(0) for tensor in teacher_inputs)
-        pad_id = self._tokenizer.pad_token_id or 0
-        padded = torch.stack([F.pad(t, (0, max_len - t.size(0)), value=pad_id) for t in teacher_inputs])
+        """Yield (start_idx, logits_chunk) via TP-rank-0 compute + broadcast.
+
+        TP rank 0 runs the actual forward pass; all other ranks in the TP group
+        receive the result via broadcast.  Different DP groups operate
+        independently and in parallel.  Chunking (opsd_teacher_chunk_size) is
+        respected so that memory stays bounded even on the rank doing the compute.
+        """
+        if not teacher_inputs:
+            return
+
         chunk_size = self._args.opsd_teacher_chunk_size
-        kwargs = {"logits_to_keep": num_logits_to_keep} if num_logits_to_keep > 0 else {}
-        torch.cuda.empty_cache()
-        n = padded.size(0)
+        n = len(teacher_inputs)
         effective_chunk = n if (chunk_size == 0 or chunk_size >= n) else chunk_size
-        with torch.no_grad():
-            for start in range(0, n, effective_chunk):
-                end = min(start + effective_chunk, n)
-                chunk = self._teachers.training_teacher(padded[start:end], **kwargs).logits
-                yield start, chunk
-                del chunk
+
+        for start in range(0, n, effective_chunk):
+            end = min(start + effective_chunk, n)
+            chunk_inputs = teacher_inputs[start:end]
+            result = self._teachers.forward_and_broadcast(
+                chunk_inputs,
+                num_logits_to_keep=num_logits_to_keep,
+                device=device,
+            )
+            if result is not None:
+                yield start, result
+                del result
 
     def _compute_opsd_kl(
         self,
@@ -348,13 +359,14 @@ class OPSDPlugin(metaclass=SingletonMeta):
             resp_len = int(batch["response_lengths"][i])
             student_logits = response_logits[i]
 
-            # Stream teacher logits one chunk at a time; reassemble only the
-            # response-tail slice on the GPU so the full (count × seq × vocab)
-            # tensor is never materialised all at once.
+            # TP rank 0 runs teacher forward, broadcasts to other TP ranks.
+            # Each chunk is processed separately to keep peak VRAM bounded.
             sample_inputs = teacher_inputs[offset : offset + count]
             offset += count
             teacher_slice_parts: list[torch.Tensor] = [None] * count  # type: ignore[list-item]
-            for chunk_start, chunk in self._iter_teacher_chunks(sample_inputs, num_logits_to_keep=resp_len):
+            for chunk_start, chunk in self._iter_teacher_chunks_broadcast(
+                sample_inputs, num_logits_to_keep=resp_len, device=device
+            ):
                 chunk_end = chunk_start + chunk.size(0)
                 for j in range(chunk_start, chunk_end):
                     teacher_slice_parts[j] = chunk[j - chunk_start, -resp_len:].to(device)

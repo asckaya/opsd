@@ -2,13 +2,37 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+def _get_tp_info() -> tuple[int, int, object | None]:
+    """Return (tp_rank, tp_world_size, tp_group). Falls back to (0, 1, None) outside Megatron."""
+    try:
+        from megatron.core import mpu
+
+        return (
+            mpu.get_tensor_model_parallel_rank(),
+            mpu.get_tensor_model_parallel_world_size(),
+            mpu.get_tensor_model_parallel_group(),
+        )
+    except Exception:
+        return 0, 1, None
 
 
 class OPSDTeacherManager:
     """Lazily manage the training teacher for OPSD.
 
     The training teacher is used for mixture-teacher distillation and may be EMA-updated.
+
+    Within a tensor-parallel (TP) group all ranks process the same batch, so
+    we only load and run the HuggingFace teacher on **TP rank 0** and broadcast
+    the resulting logits to the other ranks in the group.  Each data-parallel
+    (DP) group does its own independent broadcast, so DP parallelism is fully
+    preserved.
     """
 
     def __init__(self) -> None:
@@ -46,9 +70,57 @@ class OPSDTeacherManager:
         return self._training_teacher
 
     def ensure_training_teacher(self, args, reference_model=None):
-        if self._training_teacher is None:
+        """Load teacher on TP rank 0 only; other TP ranks skip the load."""
+        tp_rank, tp_world_size, _tp_group = _get_tp_info()
+        if self._training_teacher is None and (tp_rank == 0 or tp_world_size == 1):
+            logger.info("OPSD: loading teacher model on TP rank %d", tp_rank)
             self._training_teacher = self._load_hf_teacher(args, reference_model=reference_model)
         return self._training_teacher
+
+    def forward_and_broadcast(
+        self,
+        teacher_inputs: list[torch.Tensor],
+        num_logits_to_keep: int = 0,
+        device: torch.device | None = None,
+    ) -> torch.Tensor | None:
+        """Run teacher forward on TP rank 0 and broadcast result to the TP group.
+
+        Returns the logit tensor on every rank (shape: [B, seq, vocab] or
+        [B, num_logits_to_keep, vocab] when num_logits_to_keep > 0).
+        Returns None when there are no inputs.
+        """
+        if not teacher_inputs:
+            return None
+
+        tp_rank, tp_world_size, tp_group = _get_tp_info()
+
+        # --- TP rank 0 computes the logits ---
+        if tp_rank == 0:
+            assert self._training_teacher is not None, "Teacher not loaded on TP rank 0"
+            max_len = max(t.size(0) for t in teacher_inputs)
+            pad_id = 0  # resolved by caller if needed
+            import torch.nn.functional as F
+
+            padded = torch.stack([F.pad(t, (0, max_len - t.size(0)), value=pad_id) for t in teacher_inputs])
+            kwargs = {"logits_to_keep": num_logits_to_keep} if num_logits_to_keep > 0 else {}
+            torch.cuda.empty_cache()
+            with torch.no_grad():
+                result = self._training_teacher(padded, **kwargs).logits
+            # shape info for broadcast
+            shape = torch.tensor(list(result.shape), dtype=torch.long, device=result.device)
+        else:
+            result = None
+            shape = torch.zeros(3, dtype=torch.long, device=device)
+
+        # --- broadcast shape, then data ---
+        if tp_world_size > 1:
+            torch.distributed.broadcast(shape, src=0, group=tp_group)
+            if tp_rank != 0:
+                # allocate receive buffer with the dtype of the teacher (bfloat16)
+                result = torch.empty(shape.tolist(), dtype=torch.bfloat16, device=device)
+            torch.distributed.broadcast(result, src=0, group=tp_group)
+
+        return result
 
     def update_ema(self, args, model_chunks) -> None:
         if self._training_teacher is None:
