@@ -314,7 +314,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
         pad_id = self._tokenizer.pad_token_id or 0
         padded = torch.stack([F.pad(t, (0, max_len - t.size(0)), value=pad_id) for t in teacher_inputs])
         chunk_size = self._args.opsd_teacher_chunk_size
-        kwargs = {"num_logits_to_keep": num_logits_to_keep} if num_logits_to_keep > 0 else {}
+        kwargs = {"logits_to_keep": num_logits_to_keep} if num_logits_to_keep > 0 else {}
         if chunk_size == 0 or chunk_size >= padded.size(0):
             with torch.no_grad():
                 return self._teacher_model(padded, **kwargs).logits
