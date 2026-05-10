@@ -305,34 +305,26 @@ class OPSDPlugin(metaclass=SingletonMeta):
             f"{self._constants.boxed_answer_instruction}"
         )
 
-    def _forward_teacher(
+    def _iter_teacher_chunks(
         self,
         teacher_inputs: list[torch.Tensor],
         num_logits_to_keep: int = 0,
-    ) -> torch.Tensor:
+    ):
+        """Yield (start_idx, logits_chunk) pairs without ever building the full result tensor."""
         max_len = max(tensor.size(0) for tensor in teacher_inputs)
         pad_id = self._tokenizer.pad_token_id or 0
         padded = torch.stack([F.pad(t, (0, max_len - t.size(0)), value=pad_id) for t in teacher_inputs])
         chunk_size = self._args.opsd_teacher_chunk_size
         kwargs = {"logits_to_keep": num_logits_to_keep} if num_logits_to_keep > 0 else {}
         torch.cuda.empty_cache()
-        if chunk_size == 0 or chunk_size >= padded.size(0):
-            with torch.no_grad():
-                return self._teachers.training_teacher(padded, **kwargs).logits
-
-        result = None
-        row = 0
+        n = padded.size(0)
+        effective_chunk = n if (chunk_size == 0 or chunk_size >= n) else chunk_size
         with torch.no_grad():
-            for start in range(0, padded.size(0), chunk_size):
-                end = min(start + chunk_size, padded.size(0))
+            for start in range(0, n, effective_chunk):
+                end = min(start + effective_chunk, n)
                 chunk = self._teachers.training_teacher(padded[start:end], **kwargs).logits
-                if result is None:
-                    # Allocate on CPU to save GPU memory
-                    result = torch.empty(padded.size(0), *chunk.shape[1:], dtype=chunk.dtype, device='cpu')
-                result[row : row + chunk.size(0)].copy_(chunk, non_blocking=True)
+                yield start, chunk
                 del chunk
-                row += end - start
-        return result
 
     def _compute_opsd_kl(
         self,
@@ -356,11 +348,17 @@ class OPSDPlugin(metaclass=SingletonMeta):
             resp_len = int(batch["response_lengths"][i])
             student_logits = response_logits[i]
 
-            # Forward teacher for this sample's candidates only, then discard logits.
+            # Stream teacher logits one chunk at a time; reassemble only the
+            # response-tail slice on the GPU so the full (count × seq × vocab)
+            # tensor is never materialised all at once.
             sample_inputs = teacher_inputs[offset : offset + count]
             offset += count
-            teacher_logits_i = self._forward_teacher(sample_inputs, num_logits_to_keep=resp_len)
-            teacher_slice = teacher_logits_i[:, -resp_len:]
+            teacher_slice_parts: list[torch.Tensor] = [None] * count  # type: ignore[list-item]
+            for chunk_start, chunk in self._iter_teacher_chunks(sample_inputs, num_logits_to_keep=resp_len):
+                chunk_end = chunk_start + chunk.size(0)
+                for j in range(chunk_start, chunk_end):
+                    teacher_slice_parts[j] = chunk[j - chunk_start, -resp_len:].to(device)
+            teacher_slice = torch.stack(teacher_slice_parts)
 
             # Add confidence on the training side so rollout does not need to
             # load a separate teacher instance.
@@ -388,7 +386,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
             )
             if not selected:
                 continue
-            teacher_slice = teacher_slice[selected].to(student_logits.device)
+            teacher_slice = teacher_slice[selected]
 
             weights = self._get_mixture_weights(student_logits, teacher_slice)
             q_mix = 0
