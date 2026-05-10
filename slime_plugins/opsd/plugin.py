@@ -49,9 +49,11 @@ class OPSDPlugin(metaclass=SingletonMeta):
 
     def __init__(self) -> None:
         self._model = None
+        self._model_chunks = None
         self._tokenizer = None
         self._args = None
         self._teacher_model = None
+        self._bridge = None
 
     def _ensure_tokenizer(self, args) -> None:
         if self._tokenizer is None:
@@ -59,6 +61,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
 
     def _set_model(self, model) -> None:
         self._model = model[0] if isinstance(model, list) else model
+        self._model_chunks = model if isinstance(model, list) else [model]
 
     def init_hook(self, args) -> None:
         self._ensure_tokenizer(args)
@@ -346,17 +349,24 @@ class OPSDPlugin(metaclass=SingletonMeta):
         return teacher
 
     def _update_ema_teacher(self, args) -> None:
-        decay = args.opsd_ema_decay
-        model = self._model.module if hasattr(self._model, "module") else self._model
-        megatron_params = list(model.parameters())
-        teacher_params = list(self._teacher_model.parameters())
-        if len(megatron_params) != len(teacher_params):
-            raise ValueError(
-                f"EMA param count mismatch: megatron={len(megatron_params)}, teacher={len(teacher_params)}"
+        from megatron.bridge import AutoBridge
+        from slime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config, patch_megatron_model
+
+        if self._bridge is None:
+            self._bridge = patch_auto_bridge_hf_config(
+                AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
             )
-        with torch.no_grad():
-            for t_p, m_p in zip(teacher_params, megatron_params):
-                t_p.mul_(decay).add_(m_p.detach(), alpha=1.0 - decay)
+
+        decay = args.opsd_ema_decay
+        teacher_params = dict(self._teacher_model.named_parameters())
+        with patch_megatron_model(self._model_chunks):
+            for hf_tuple in self._bridge.export_hf_weights(self._model_chunks, cpu=False, show_progress=False):
+                t_param = teacher_params.get(hf_tuple.param_name)
+                if t_param is None:
+                    continue
+                with torch.no_grad():
+                    current = hf_tuple.weight.to(t_param.device, dtype=t_param.dtype)
+                    t_param.mul_(decay).add_(current, alpha=1.0 - decay)
 
     def _compute_opsd_kl(
         self,
