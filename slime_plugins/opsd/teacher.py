@@ -23,6 +23,19 @@ def _get_tp_info() -> tuple[int, int, object | None]:
         return 0, 1, None
 
 
+def _get_tp_src_rank() -> int:
+    """Return the global rank of TP local rank 0 (the broadcast source)."""
+    try:
+        import torch.distributed as dist
+        from megatron.core import mpu
+
+        tp_group = mpu.get_tensor_model_parallel_group()
+        ranks = dist.get_process_group_ranks(tp_group)
+        return ranks[0]
+    except Exception:
+        return 0
+
+
 class OPSDTeacherManager:
     """Lazily manage the training teacher for OPSD.
 
@@ -82,6 +95,7 @@ class OPSDTeacherManager:
         teacher_inputs: list[torch.Tensor],
         num_logits_to_keep: int = 0,
         device: torch.device | None = None,
+        pad_id: int = 0,
     ) -> torch.Tensor | None:
         """Run teacher forward on TP rank 0 and broadcast result to the TP group.
 
@@ -93,12 +107,12 @@ class OPSDTeacherManager:
             return None
 
         tp_rank, tp_world_size, tp_group = _get_tp_info()
+        src_rank = _get_tp_src_rank()
 
         # --- TP rank 0 computes the logits ---
         if tp_rank == 0:
             assert self._training_teacher is not None, "Teacher not loaded on TP rank 0"
             max_len = max(t.size(0) for t in teacher_inputs)
-            pad_id = 0  # resolved by caller if needed
             import torch.nn.functional as F
 
             padded = torch.stack([F.pad(t, (0, max_len - t.size(0)), value=pad_id) for t in teacher_inputs])
@@ -114,11 +128,11 @@ class OPSDTeacherManager:
 
         # --- broadcast shape, then data ---
         if tp_world_size > 1:
-            torch.distributed.broadcast(shape, src=0, group=tp_group)
+            torch.distributed.broadcast(shape, src=src_rank, group=tp_group)
             if tp_rank != 0:
                 # allocate receive buffer with the dtype of the teacher (bfloat16)
                 result = torch.empty(shape.tolist(), dtype=torch.bfloat16, device=device)
-            torch.distributed.broadcast(result, src=0, group=tp_group)
+            torch.distributed.broadcast(result, src=src_rank, group=tp_group)
 
         return result
 

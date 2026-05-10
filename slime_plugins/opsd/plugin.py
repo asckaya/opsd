@@ -116,8 +116,15 @@ class OPSDPlugin(metaclass=SingletonMeta):
 
         if not self._model:
             return base_loss, metrics
-        if not self._teachers.training_teacher:
-            return base_loss, metrics
+
+        # ── TP-aware guard ───────────────────────────────────────────────────
+        # Non-TP-rank-0 ranks have no teacher loaded, but they MUST still enter
+        # _compute_opsd_kl so they can participate in the broadcast collective.
+        # We only skip entirely when the *entire* TP group has no work to do
+        # (detected by teacher_inputs being empty, which is consistent across
+        # all ranks because metadata comes from the same batch).
+        # Never do an early-return on training_teacher alone.
+        # ────────────────────────────────────────────────────────────────────
 
         metadata_list = batch.get("metadata")
         if metadata_list is None:
@@ -321,6 +328,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
         if not teacher_inputs:
             return
 
+        pad_id = self._tokenizer.pad_token_id or 0
         chunk_size = self._args.opsd_teacher_chunk_size
         n = len(teacher_inputs)
         effective_chunk = n if (chunk_size == 0 or chunk_size >= n) else chunk_size
@@ -332,6 +340,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
                 chunk_inputs,
                 num_logits_to_keep=num_logits_to_keep,
                 device=device,
+                pad_id=pad_id,
             )
             if result is not None:
                 yield start, result
