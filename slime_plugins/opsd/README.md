@@ -23,12 +23,30 @@ By default the teacher is a **frozen snapshot of the initial actor weights**
 ## Frozen-teacher mechanism
 
 `--opsd-freeze-teacher` (default `true`) snapshots the initial actor weights at
-init time into the `"teacher"` slot of slime's `weights_backuper`.  Inside
-`loss_function`, the plugin swaps the live `nn.Module` to those teacher weights
-around `teacher_forward` / `compute_trace_confs`, then restores the actor
-weights before returning so the autograd backward (which fires after
-`loss_function` returns) sees the student parameters and produces correct
-gradients.
+init time into the `"teacher"` slot of slime's `weights_backuper`.  Implementation
+follows **path B**: all teacher-dependent work (Conf, TopK_b, diversity selection,
+and `teacher_forward`) runs inside `before_train_step_hook`, **before** the
+autograd-tracked student forward starts.
+
+  1. Swap the live module to teacher weights (in-place `param.copy_()`; safe at
+     this point because no `SavedTensor` exists yet for the upcoming forward).
+  2. Iterate the train step's `data_iterator` over all microbatches; for each
+     microbatch run Conf + selection + `teacher_forward`, then detach + offload
+     the selected teacher logits to CPU.
+  3. Reset the iterator and swap back to actor weights.
+
+`loss_function` then pops the precomputed teacher outputs per microbatch and
+runs only the student-dependent parts (mixture weights, `q_mix`, KL).
+
+Memory at peak (Qwen3, N=4, T=2048, V≈152k, bf16): ~600 MB per trace × N × num
+microbatches on host RAM; GPU only ever holds one microbatch's teacher logits at
+a time, matching the legacy in-loss path.
+
+A previous attempt (**path A**) swapped weights inside `loss_function`, but
+`weights_backuper.restore` bumps the parameter's storage version counter via
+`param.copy_()`, and Megatron's `RowParallelLinear.backward` raises a version
+mismatch on the saved weight tensor.  Path B sidesteps the issue by ensuring
+the swap completes before any `SavedTensor` is created.
 
 Conf(τ) is invariant for a frozen teacher, so the plugin caches Conf per
 `id(cand_tokens_list)` for the lifetime of a rollout and reuses it across

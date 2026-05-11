@@ -12,7 +12,7 @@ from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 
 from . import rollout as rollout_module
-from .distillation import build_teacher_inputs, distillation_loss, extract_student_responses
+from .distillation import distillation_loss, extract_student_responses, prepare_teacher_outputs
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,11 @@ class OPSDPlugin(metaclass=SingletonMeta):
         # since rollout.py shares the same Python list across the n_samples_per_prompt
         # samples of a group and that list survives for the rollout's lifetime.
         self._conf_cache: dict[int, list[float]] = {}
+        # Per-train-step cache of precomputed teacher outputs, one entry per
+        # microbatch.  Populated by `before_train_step_hook` when freeze is on,
+        # consumed in order by `loss_function`.
+        self._teacher_cache: list[list[dict | None]] = []
+        self._mb_counter = 0
 
     # ── slime hooks ───────────────────────────────────────────────────────────
 
@@ -62,15 +67,63 @@ class OPSDPlugin(metaclass=SingletonMeta):
             )
         self._model = model[0] if isinstance(model, list) else model
         self._actor = slime_actor
-        # data_iterator / num_microbatches are accepted for the upcoming path-B
-        # implementation (precompute teacher outputs in this hook with the
-        # frozen teacher loaded). The in-loss swap that was tried first bumps
-        # parameter version counters inside Megatron's autograd window and
-        # trips the SavedVariable version check during backward, so it has
-        # been removed; the frozen-teacher path is currently inert.
-        del data_iterator, num_microbatches
+
+        # Reset per-step state.
+        self._teacher_cache = []
+        self._mb_counter = 0
+        # New rollout ⇒ new privileged traces ⇒ old Conf cache is dead.
         if step_id == 0:
             self._conf_cache.clear()
+
+        if not args.opsd_freeze_teacher:
+            # Legacy "teacher = current student" path: teacher forwards are
+            # computed inline from `loss_function`, against the live student
+            # weights. Nothing to precompute here.
+            return
+
+        # Path B — precompute all teacher outputs for this train step BEFORE
+        # the autograd-tracked student forward starts.  In-place weight swaps
+        # bump parameter version counters; doing them here is safe because no
+        # SavedTensor exists yet for the upcoming forward.
+        assert "teacher" in slime_actor.weights_backuper.backup_tags, (
+            "OPSD: --opsd-freeze-teacher set but no 'teacher' tag was snapshotted; "
+            "the actor init should have produced one."
+        )
+        assert isinstance(data_iterator, list) and len(data_iterator) == 1, (
+            "OPSD requires pipeline-parallel-size=1 / VPP=1; data_iterator must be a " "single-element list."
+        )
+        iterator = data_iterator[0]
+
+        # Save the iterator's current offset so Megatron's subsequent
+        # forward_backward_func sees the same microbatches we precomputed.
+        # `train()` only resets iterators once per rollout, so if
+        # `num_steps_per_rollout > 1` each step starts where the previous left
+        # off — a naive `reset()` here would replay step 0's data forever.
+        saved_offset = iterator.offset
+
+        slime_actor.switch_model("teacher")
+        try:
+            for _ in range(num_microbatches):
+                mb = iterator.get_next(["tokens", "response_lengths", "metadata"])
+                mb_batch = {
+                    "response_lengths": mb["response_lengths"],
+                    "unconcat_tokens": mb["tokens"],
+                    "metadata": mb["metadata"],
+                }
+                outputs = prepare_teacher_outputs(
+                    args,
+                    mb_batch,
+                    mb["metadata"],
+                    mb["tokens"],
+                    self._tokenizer,
+                    self._model,
+                    self._conf_cache,
+                    offload_to_cpu=True,
+                )
+                self._teacher_cache.append(outputs)
+            iterator.offset = saved_offset
+        finally:
+            slime_actor.switch_model("actor")
 
     # ── rollout ───────────────────────────────────────────────────────────────
 
@@ -89,40 +142,30 @@ class OPSDPlugin(metaclass=SingletonMeta):
         assert self._model is not None, "OPSD: model not set — before_train_step_hook not called"
         assert self._tokenizer is not None, "OPSD: tokenizer not set — init_hook not called"
 
-        metadata_list = batch["metadata"]
-        unconcat_tokens = batch["unconcat_tokens"]
-
         student_logits = extract_student_responses(logits, args, batch)
-        q_inputs, conf_inputs, trace_tokens_flat, counts, cand_scores, cand_tokens = build_teacher_inputs(
-            batch, metadata_list, unconcat_tokens, self._tokenizer
-        )
-        if not any(n > 0 for n in counts):
+
+        if args.opsd_freeze_teacher:
+            # Pop the precomputed (frozen-teacher) outputs for this microbatch.
+            sample_teacher_outputs = self._teacher_cache[self._mb_counter]
+            self._mb_counter += 1
+        else:
+            # Legacy: compute teacher outputs inline against the current student
+            # weights, on the same device (no CPU offload).
+            sample_teacher_outputs = prepare_teacher_outputs(
+                args,
+                batch,
+                batch["metadata"],
+                batch["unconcat_tokens"],
+                self._tokenizer,
+                self._model,
+                self._conf_cache,
+                offload_to_cpu=False,
+            )
+
+        if not any(o is not None for o in sample_teacher_outputs):
             return base_loss, metrics
 
-        # NOTE: the frozen-teacher swap (path A: swap weights inside this loss
-        # function) was removed because `weights_backuper.restore` does an
-        # in-place `param.copy_()`, which increments the storage version
-        # counter. Autograd captured the student weight at version V during
-        # the outer forward; backward then sees version V+2 and aborts with
-        # "one of the variables needed for gradient computation has been
-        # modified by an inplace operation". Path B (precompute teacher
-        # outputs in `before_train_step_hook`, fully outside the autograd
-        # window) will replace this once wired. For now teacher forwards run
-        # against the current student weights — set `--no-opsd-freeze-teacher`
-        # in scripts to match this behavior and skip the unused snapshot.
-        opsd_kl, opsd_metrics = distillation_loss(
-            args,
-            batch,
-            student_logits,
-            q_inputs,
-            conf_inputs,
-            trace_tokens_flat,
-            counts,
-            cand_scores,
-            cand_tokens,
-            self._model,
-            conf_cache=self._conf_cache,
-        )
+        opsd_kl, opsd_metrics = distillation_loss(args, batch, student_logits, sample_teacher_outputs)
 
         total_loss = base_loss + args.opsd_alpha * opsd_kl
         metrics.update({"opsd_kl": opsd_kl.detach(), "opsd_total": total_loss.detach()})

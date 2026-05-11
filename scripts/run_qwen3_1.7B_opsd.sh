@@ -79,9 +79,6 @@ OPSD_ARGS=(
                                         # happen FIRST and q_forward run only on
                                         # the N selected traces — halves cost.
    --opsd-diversity-top-k 128 # Top-K vocab truncation for token-level JSD
-   --no-opsd-freeze-teacher   # Path-A (in-loss weight swap) hits autograd's
-                              # SavedVariable version check; use the sync-with-
-                              # student teacher (legacy) until path B lands.
 )
 
 # Performance & Parallelism
@@ -155,7 +152,7 @@ ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-s
 
 # Submit Job
 ray job submit --address="http://127.0.0.1:8088" \
-   --runtime-env-json='{"env_vars": {"CUDA_DEVICE_MAX_CONNECTIONS": "1", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}}' \
+   --runtime-env-json='{"env_vars": {"CUDA_DEVICE_MAX_CONNECTIONS": "1"}}' \
    -- python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 8 \
