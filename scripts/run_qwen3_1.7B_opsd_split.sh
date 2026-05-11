@@ -1,7 +1,19 @@
 #!/bin/bash
 
-# Diverse Self-Privileged OPSD Training Script for Qwen3-1.7B
-# This script uses the OPSD plugin to generate 16 samples and select up to 8 diverse traces for distillation.
+# Diverse Self-Privileged OPSD Training Script for Qwen3-1.7B — SPLIT MODE
+# Variant of run_qwen3_1.7B_opsd.sh that disaggregates actor and rollout onto
+# separate GPU sets (4 actor + 4 rollout, total 8 GPUs).
+#
+# When this beats the colocate version:
+#   • Rollout (sglang generation) and training step can overlap rather than
+#     run sequentially.
+#   • SGLang owns its 4 GPUs at high memory fraction (no contention with
+#     training), so it can use larger KV cache and run faster per request.
+#
+# When colocate wins:
+#   • Training step is the dominant cost and benefits from more DP workers
+#     (8 GPUs for actor vs 4). OPSD makes training-step heavy due to the
+#     teacher forwards, so this is the case to benchmark against.
 
 set -ex
 
@@ -16,17 +28,15 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 # --- Configuration ---
-# Path to the Qwen3-1.7B checkpoint and data
 HF_CHECKPOINT=${HF_CHECKPOINT:-"/path/to/Qwen3-1.7B"}
 PROMPT_DATA=${PROMPT_DATA:-"data/opsd_math_30k.jsonl"}
-SAVE_DIR=${SAVE_DIR:-"./checkpoints/qwen3-1.7b-opsd"}
+SAVE_DIR=${SAVE_DIR:-"./checkpoints/qwen3-1.7b-opsd-split"}
 LOAD_DIR=${LOAD_DIR:-"${HF_CHECKPOINT}"}
 EVAL_CONFIG_PATH=${EVAL_CONFIG_PATH:-"data/preprocess/test/eval_config.yaml"}
 EVAL_INTERVAL=${EVAL_INTERVAL:-50}
 
 # Environment setup
 export PYTHONPATH=$PYTHONPATH${PYTHONPATH:+:}.
-# If you haven't prepared the dataset yet, run data/preprocess/prepare_opsd_dataset.py first.
 source "scripts/models/qwen3-1.7B.sh"
 
 # --- Arguments ---
@@ -48,43 +58,37 @@ ROLLOUT_ARGS=(
    --rollout-batch-size 16
    --rollout-max-response-len 2048
    --rollout-temperature 1.0
-   
+
    --global-batch-size 128
    --n-samples-per-prompt 1  # Base n_samples, OPSD rollout will override this to opsd_k
 )
 
 # OPSD Plugin Arguments
 OPSD_ARGS=(
-   # Function paths (pointing to the __init__.py entry points)
    --rollout-function-path slime_plugins.opsd.generate_rollout
    --custom-megatron-init-path slime_plugins.opsd.init_hook
    --custom-megatron-before-train-step-hook-path slime_plugins.opsd.before_train_step_hook
    --loss-type custom_loss
    --custom-loss-function-path slime_plugins.opsd.loss_function
 
-   # OPSD Hyperparameters — tuned for throughput while staying inside
-   # metho.md §13 recommendations (K=8-32, N=2-4, K_b=8-16).
-   --opsd-k 16                # Sample 16 trajectories (K)
-   --opsd-n 4                 # Select 4 diverse traces (N) — metho.md recommends 2-4
-   --opsd-kb 8                # Pre-filter top 8 by quality (K_b) — halves q_forwards vs K_b=16
-   --opsd-alpha 1.0           # Distillation loss weight (alpha)
-   --opsd-kl-weight 1.0       # Mixture weight KL coeff (beta)
-   --opsd-entropy-weight 0.5  # Mixture weight Entropy coeff (gamma)
-   --opsd-diversity-weight 0.5 # Mixture weight Diversity coeff (rho)
-   --opsd-temperature 1.0     # Temperature for mixture weights
-   --opsd-weight-top-k 512    # Efficiency: truncate vocab for weights
-   --opsd-diversity-metric unigram_jsd  # token_jsd is metho.md-recommended but
-                                        # forces q_forward on all K_b candidates.
-                                        # unigram_jsd lets diversity selection
-                                        # happen FIRST and q_forward run only on
-                                        # the N selected traces — halves cost.
-   --opsd-diversity-top-k 128 # Top-K vocab truncation for token-level JSD
+   --opsd-k 16
+   --opsd-n 4
+   --opsd-kb 8
+   --opsd-alpha 1.0
+   --opsd-kl-weight 1.0
+   --opsd-entropy-weight 0.5
+   --opsd-diversity-weight 0.5
+   --opsd-temperature 1.0
+   --opsd-weight-top-k 512
+   --opsd-diversity-metric unigram_jsd  # see run_qwen3_1.7B_opsd.sh for rationale
+   --opsd-diversity-top-k 128
 )
 
-# Performance & Parallelism
+# Performance & Parallelism — actor side
+# With 4 actor GPUs instead of 8, each GPU now sees ~2x more samples per step.
+# Keep micro-batch-size 1 and let dynamic batching pack to --max-tokens-per-gpu.
 PERF_ARGS=(
    --tensor-model-parallel-size 1
-   # sequence-parallel only helps when TP>1; with TP=1 it's pure overhead.
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
    --expert-model-parallel-size 1
@@ -98,7 +102,6 @@ PERF_ARGS=(
    --attention-backend flash
 )
 
-# Optimizer
 OPTIMIZER_ARGS=(
    --optimizer adam
    --lr 1e-6
@@ -115,13 +118,13 @@ RM_ARGS=(
 TB_ARGS=(
     --use-tensorboard
     --tb-project-name opsd
-    --tb-experiment-name qwen3-1.7b-opsd
+    --tb-experiment-name qwen3-1.7b-opsd-split
 )
 
 WANDB_ARGS=(
     # --use-wandb
     # --wandb-project opsd
-    # --wandb-group qwen3-1.7b-opsd
+    # --wandb-group qwen3-1.7b-opsd-split
     # --wandb-key ${WANDB_KEY}
 )
 
@@ -130,9 +133,10 @@ EVAL_ARGS=(
     --eval-config ${EVAL_CONFIG_PATH}
 )
 
+# SGLang owns its 4 dedicated GPUs — push memory fraction up to use them well.
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.35
+   --sglang-mem-fraction-static 0.85
 )
 
 MISC_ARGS=(
@@ -145,19 +149,17 @@ MISC_ARGS=(
 
 # --- Execution ---
 
-# Start Ray
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 ray stop --force || true
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8088
 
-# Submit Job
+# Submit Job — note: NO --colocate, and the actor/rollout GPU splits are 4/4.
 ray job submit --address="http://127.0.0.1:8088" \
    --runtime-env-json='{"env_vars": {"CUDA_DEVICE_MAX_CONNECTIONS": "1"}}' \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 8 \
-   --colocate \
-   --rollout-num-gpus 8 \
+   --actor-num-gpus-per-node 4 \
+   --rollout-num-gpus 4 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
