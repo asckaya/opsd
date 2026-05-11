@@ -97,30 +97,45 @@ def teacher_forward(
     inputs: list[torch.Tensor],
     resp_len: int,
     pad_id: int,
+    chunk_size: int = 2,
 ) -> torch.Tensor:
     """Run π_θ(·| x, τ_k, y_{<t}) in no_grad using the current training model.
 
+    Processes inputs in chunks to bound peak memory.  The full logit tensor
+    [N, max_len, vocab] is produced by Megatron in fp32 — for Qwen3-1.7B with
+    N=16 and max_len≈2400 this is ~23 GB, which OOMs a training GPU.
+    By chunking to chunk_size=2 we cap the allocation at ~3 GB per chunk.
+
     Args:
-        model:    Training model (DDP-wrapped Megatron GPTModel).
-        inputs:   List of [prompt_with_priv_context + response] token tensors.
-        resp_len: Number of response tokens; logits for the last resp_len positions
-                  are returned.
-        pad_id:   Padding token id for right-padding to equal length.
+        model:      Training model (DDP-wrapped Megatron GPTModel).
+        inputs:     List of [prompt_with_priv_context + response] token tensors.
+        resp_len:   Response length; only the last resp_len logit positions are kept.
+        pad_id:     Token id used for right-padding within each chunk.
+        chunk_size: Traces per forward pass.  Lower = less peak memory.
 
     Returns:
         [N, resp_len, V] float32 logits.
     """
-    max_len = max(t.size(0) for t in inputs)
     device = inputs[0].device
-    padded = torch.stack([
-        F.pad(t, (0, max_len - t.size(0)), value=pad_id) for t in inputs
-    ]).to(device)
+    chunks: list[torch.Tensor] = []
 
-    with torch.no_grad():
-        out = model(input_ids=padded, position_ids=None, attention_mask=None, labels=None)
+    for start in range(0, len(inputs), chunk_size):
+        batch = inputs[start : start + chunk_size]
+        max_len = max(t.size(0) for t in batch)
+        padded = torch.stack([
+            F.pad(t, (0, max_len - t.size(0)), value=pad_id) for t in batch
+        ]).to(device)
 
-    logits = out[0] if isinstance(out, tuple) else out
-    return logits[:, -resp_len:].float()
+        with torch.no_grad():
+            out = model(input_ids=padded, position_ids=None, attention_mask=None, labels=None)
+        del padded
+
+        raw = out[0] if isinstance(out, tuple) else out
+        chunks.append(raw[:, -resp_len:].float())  # slice immediately; free the rest
+        del out, raw
+        torch.cuda.empty_cache()
+
+    return torch.cat(chunks, dim=0)  # [N, resp_len, V]
 
 
 # ── quality: conf term (§4) ──────────────────────────────────────────────────
