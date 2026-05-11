@@ -110,6 +110,12 @@ class MegatronTrainRayActor(TrainRayActor):
         # Load teacher model for Megatron-based on-policy distillation
         if with_opd_teacher:
             self.load_other_checkpoint("teacher", args.opd_teacher_load)
+        elif args.opsd_freeze_teacher:
+            # OPSD: snapshot the initial actor as the immutable "teacher" tag
+            # (paper §4.1 "fix the teacher policy to be the initial policy").
+            # No separate checkpoint — the current actor weights at init *are*
+            # the initial policy.
+            self.weights_backuper.backup("teacher")
 
         if self.args.keep_old_actor:
             # Load old_actor checkpoint
@@ -264,6 +270,19 @@ class MegatronTrainRayActor(TrainRayActor):
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
 
+    def switch_model(self, target_tag: str) -> None:
+        """Public alias for `_switch_model`, for use by custom plugins (e.g. OPSD).
+
+        Plugins receive `slime_actor` via the `before_train_step_hook` kwarg and
+        can call this to swap in the frozen teacher / restore the actor around
+        their teacher forwards.
+        """
+        self._switch_model(target_tag)
+
+    @property
+    def active_model_tag(self) -> str | None:
+        return self._active_model_tag
+
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
         if "rollout_routed_experts" not in rollout_data:
             raise ValueError(
@@ -397,6 +416,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.opt_param_scheduler,
             data_iterator,
             num_microbatches,
+            slime_actor=self,
         )
 
         if mpu.is_pipeline_last_stage() and "values" in rollout_data:
@@ -490,6 +510,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.opt_param_scheduler,
                     data_iterator,
                     num_microbatches,
+                    slime_actor=self,
                 )
 
             self.prof.step(rollout_id=rollout_id)

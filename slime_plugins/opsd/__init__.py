@@ -13,9 +13,11 @@ def init_hook(args):
     OPSDPlugin().init_hook(args)
 
 
-def before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler):
+def before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler, slime_actor):
     """Megatron before-train-step hook entrypoint (registers the training model)."""
-    OPSDPlugin().before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
+    OPSDPlugin().before_train_step_hook(
+        args, rollout_id, step_id, model, optimizer, opt_param_scheduler, slime_actor=slime_actor
+    )
 
 
 def loss_function(args, batch, logits, sum_of_sample_mean):

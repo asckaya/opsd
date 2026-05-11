@@ -569,6 +569,7 @@ def distillation_loss(
     cand_scores: list[list[float]],
     cand_tokens: list[list[list[int]]],
     model: torch.nn.Module,
+    conf_cache: dict[int, list[float]],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute OPSD KL loss over the batch (metho.md §4, §6-9).
 
@@ -578,8 +579,10 @@ def distillation_loss(
     V≈152k this peaks at ≈4.8 GB per sample alongside the model.
 
     §4 Conf(τ_k) is computed by compute_trace_confs via a dedicated forward over
-    chat(x) + τ_k — separate from the q_k^t forward, per metho.md §4. Results
-    are cached per rollout group (same x, same τ set across samples).
+    chat(x) + τ_k — separate from the q_k^t forward, per metho.md §4.  The
+    caller supplies a `conf_cache` keyed by `id(cand_tokens_list)`; with a
+    frozen teacher this cache is reused across train steps within a rollout
+    (same traces ⇒ same Conf).
 
     §8 q_mix is built per-TP-shard: teacher softmax is computed on GPU over the
     full vocab and only the local shard accumulates into q_mix_local.
@@ -611,15 +614,14 @@ def distillation_loss(
     w_entropy_count = 0
     valid = 0
     offset = 0
-    # Same rollout group shares privileged candidates (same problem, same τ set),
-    # so Conf(τ_k) is identical across the n_samples_per_prompt samples of that
-    # group. Cache by the `cand_tokens[i]` list identity: rollout.py shares the
-    # same Python list across same-group samples, and build_teacher_inputs
-    # propagates that identity through `cand_tokens.append(traces)`. If identity
-    # is broken (e.g. deep copy in some data path), the cache simply misses and
-    # we fall back to recomputing — still correct.
-    conf_cache: dict[int, list[float]] = {}
-
+    # Conf(τ_k) is invariant across the n_samples_per_prompt samples of a rollout
+    # group (same problem, same τ set), and — when the teacher is frozen — across
+    # train steps as well.  Key by the `cand_tokens[i]` list identity: rollout.py
+    # shares the same Python list across same-group samples and
+    # build_teacher_inputs propagates that identity through `cand_tokens.append`.
+    # The plugin owns the cache so it survives across `distillation_loss` calls
+    # for the lifetime of a rollout; if list identity is broken on some data
+    # path, the cache simply misses and recomputes — still correct.
     for i, n in enumerate(counts):
         if n == 0:
             continue

@@ -367,6 +367,7 @@ def train_one_step(
     optimizer: MegatronOptimizer,
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
+    slime_actor=None,
 ) -> tuple[dict[str, float], float]:
     """Execute a single pipeline-parallel training step.
 
@@ -398,7 +399,9 @@ def train_one_step(
         from slime.utils.misc import load_function
 
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
-        custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
+        custom_before_train_step_hook(
+            args, rollout_id, step_id, model, optimizer, opt_param_scheduler, slime_actor=slime_actor
+        )
 
     def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[
         torch.Tensor,
@@ -558,6 +561,7 @@ def train(
     opt_param_scheduler: OptimizerParamScheduler,
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
+    slime_actor=None,
 ) -> None:
     """Run training over a rollout consisting of multiple steps.
 
@@ -660,6 +664,7 @@ def train(
             optimizer,
             opt_param_scheduler,
             num_microbatches[step_id],
+            slime_actor=slime_actor,
         )
 
         if step_id == 0:

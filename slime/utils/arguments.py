@@ -1415,6 +1415,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=128,
                 help="Top-K vocab truncation for token-level JSD diversity",
             )
+            parser.add_argument(
+                "--opsd-freeze-teacher",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Snapshot the initial actor weights as the OPSD teacher and use them "
+                    "unchanged for every teacher / Conf forward (paper §4.1: 'fix the "
+                    "teacher policy to be the initial policy, rather than the currently "
+                    "updating learning policy'). When False, teacher forwards run against "
+                    "the current student weights — legacy behavior; loses the implicit "
+                    "regularization toward the initial policy."
+                ),
+            )
             return parser
 
         def add_mtp_training_arguments(parser):
@@ -1725,6 +1738,18 @@ def slime_validate_args(args):
         # If OPD is not enabled, opd_teacher_load should not be set
         if args.opd_teacher_load is not None:
             raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
+
+    if args.opsd_freeze_teacher:
+        if not args.enable_weights_backuper:
+            raise ValueError(
+                "--opsd-freeze-teacher requires --enable-weights-backuper, since the "
+                "frozen teacher is stored as a second tag inside the weights backuper."
+            )
+        if args.use_opd and args.opd_type == "megatron":
+            raise ValueError(
+                "--opsd-freeze-teacher and --opd-type=megatron both occupy the 'teacher' "
+                "weights tag for different purposes. Disable one of them."
+            )
 
     if args.megatron_to_hf_mode == "bridge":
         if (

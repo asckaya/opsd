@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import torch
 
@@ -21,20 +22,47 @@ class OPSDPlugin(metaclass=SingletonMeta):
         self._model: torch.nn.Module | None = None
         self._tokenizer = None
         self._args = None
+        # MegatronTrainRayActor — typed as Any to avoid a circular import with
+        # the slime backend; we only ever call `.role`, `.weights_backuper`, and
+        # `.switch_model(tag)` on it.
+        self._actor: Any = None
+        # Frozen teacher ⇒ Conf(τ_k) is invariant for a given trace, so we can
+        # cache it across train steps within a rollout. Keyed by `id(cand_tokens_list)`
+        # since rollout.py shares the same Python list across the n_samples_per_prompt
+        # samples of a group and that list survives for the rollout's lifetime.
+        self._conf_cache: dict[int, list[float]] = {}
 
     # ── slime hooks ───────────────────────────────────────────────────────────
 
     def init_hook(self, args) -> None:
         self._tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
 
-    def before_train_step_hook(self, args, rollout_id, step_id, model, optimizer, opt_param_scheduler) -> None:
+    def before_train_step_hook(
+        self, args, rollout_id, step_id, model, optimizer, opt_param_scheduler, slime_actor
+    ) -> None:
         from megatron.core.parallel_state import get_pipeline_model_parallel_world_size
+
+        # The same hook path may be invoked from the critic's train loop; OPSD
+        # is actor-only, so silently skip non-actor roles.
+        if slime_actor.role != "actor":
+            return
 
         if get_pipeline_model_parallel_world_size() > 1:
             raise NotImplementedError(
                 "OPSD plugin requires pipeline-model-parallel-size=1; teacher_forward and compute_trace_confs call model(...) directly, bypassing pipeline scheduling."
             )
         self._model = model[0] if isinstance(model, list) else model
+        self._actor = slime_actor
+        if args.opsd_freeze_teacher:
+            assert "teacher" in self._actor.weights_backuper.backup_tags, (
+                "OPSD: --opsd-freeze-teacher set but no 'teacher' tag was snapshotted; "
+                "the actor init should have produced one."
+            )
+        # New rollout ⇒ new privileged traces ⇒ old Conf cache is dead.  Drop it
+        # at the start of step 0 to bound memory and avoid stale id() collisions
+        # when Python reuses list ids across rollouts.
+        if step_id == 0:
+            self._conf_cache.clear()
 
     # ── rollout ───────────────────────────────────────────────────────────────
 
@@ -63,18 +91,30 @@ class OPSDPlugin(metaclass=SingletonMeta):
         if not any(n > 0 for n in counts):
             return base_loss, metrics
 
-        opsd_kl, opsd_metrics = distillation_loss(
-            args,
-            batch,
-            student_logits,
-            q_inputs,
-            conf_inputs,
-            trace_tokens_flat,
-            counts,
-            cand_scores,
-            cand_tokens,
-            self._model,
-        )
+        # Paper §4.1: teacher == initial policy.  Swap to the frozen teacher snapshot
+        # around the teacher forwards, restore the actor before returning so the
+        # autograd backward (which runs after we return) sees student weights.
+        if args.opsd_freeze_teacher:
+            assert self._actor is not None, "OPSD: before_train_step_hook did not register the actor"
+            self._actor.switch_model("teacher")
+        try:
+            opsd_kl, opsd_metrics = distillation_loss(
+                args,
+                batch,
+                student_logits,
+                q_inputs,
+                conf_inputs,
+                trace_tokens_flat,
+                counts,
+                cand_scores,
+                cand_tokens,
+                self._model,
+                conf_cache=self._conf_cache,
+            )
+        finally:
+            if args.opsd_freeze_teacher:
+                self._actor.switch_model("actor")
+
         total_loss = base_loss + args.opsd_alpha * opsd_kl
         metrics.update({"opsd_kl": opsd_kl.detach(), "opsd_total": total_loss.detach()})
         metrics.update(opsd_metrics)

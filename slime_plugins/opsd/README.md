@@ -2,22 +2,42 @@
 
 On-policy self-distillation (OPD): the student's own successful reasoning traces
 serve as privileged information for token-level mixture-teacher distillation.
-No separate teacher model — the training model itself is used for teacher inference.
+By default the teacher is a **frozen snapshot of the initial actor weights**
+(paper §4.1), so no separate teacher checkpoint is required.
 
 ## Algorithm
 
 1. **Rollout**: Sample K trajectories per prompt from the current policy.
 2. **Filter**: Keep correct traces `B_x = {τ | R(x, τ) = 1}`.
 3. **Quality score**: `s(τ) = 1 - η_l·len/L - η_f·format + η_c·conf`.
-   `conf = (1/|τ|) Σ_t log π_θ(τ_t | x, τ_<t)` from a dedicated forward over
+   `conf = (1/|τ|) Σ_t log π_T(τ_t | x, τ_<t)` from a dedicated forward over
    `chat(x) + τ_k` (metho.md §4).
 4. **TopK_b**: Retain top-K_b candidates by full quality score, applied *before*
    the q-teacher forward so discarded candidates are not run through the
    expensive q-forward.
 5. **Diversity**: Select N traces `P_x` via k-center greedy (unigram-JSD or token-JSD).
-6. **Teacher**: `q_k^t = π_θ(·| x, τ_k, y_{<t})` — same weights, privileged context.
+6. **Teacher**: `q_k^t = π_T(·| x, τ_k, y_{<t})` — frozen initial weights, privileged context.
 7. **Weights**: `w_k^t ∝ exp(-β·Δ_k^t - γ·h_k^t + ρ·g_k^t)`.
 8. **Distill**: `L = KL(Σ_k w_k^t q_k^t ‖ p_θ^t)`.
+
+## Frozen-teacher mechanism
+
+`--opsd-freeze-teacher` (default `true`) snapshots the initial actor weights at
+init time into the `"teacher"` slot of slime's `weights_backuper`.  Inside
+`loss_function`, the plugin swaps the live `nn.Module` to those teacher weights
+around `teacher_forward` / `compute_trace_confs`, then restores the actor
+weights before returning so the autograd backward (which fires after
+`loss_function` returns) sees the student parameters and produces correct
+gradients.
+
+Conf(τ) is invariant for a frozen teacher, so the plugin caches Conf per
+`id(cand_tokens_list)` for the lifetime of a rollout and reuses it across
+train steps.
+
+Requires `--enable-weights-backuper` (multi-tag mode).  Mutually exclusive with
+`--opd-type=megatron`, which uses the same `"teacher"` tag for a separately-
+loaded teacher checkpoint.  Pass `--no-opsd-freeze-teacher` to revert to the
+legacy behavior of running teacher forwards against the current student weights.
 
 ## Constraints
 
@@ -85,6 +105,7 @@ See `scripts/run_qwen3_1.7B_opsd.sh` for a complete example.
 | `--opsd-quality-conf-norm` | `rank` | How to normalize Conf across a sample's candidates: `raw`/`zscore`/`minmax`/`rank` |
 | `--opsd-diversity-metric` | `token_jsd` | `token_jsd` or `unigram_jsd` |
 | `--opsd-diversity-top-k` | 128 | Vocab truncation for token-JSD diversity |
+| `--opsd-freeze-teacher` | true | Use frozen initial-policy snapshot as the teacher (paper §4.1). Disable with `--no-opsd-freeze-teacher` |
 
 ## Logged metrics
 
