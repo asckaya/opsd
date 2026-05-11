@@ -28,6 +28,12 @@ class OPSDPlugin(metaclass=SingletonMeta):
         self._tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
 
     def before_train_step_hook(self, args, rollout_id, step_id, model, optimizer, opt_param_scheduler) -> None:
+        from megatron.core.parallel_state import get_pipeline_model_parallel_world_size
+
+        if get_pipeline_model_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "OPSD plugin requires pipeline-model-parallel-size=1; teacher_forward and compute_trace_confs call model(...) directly, bypassing pipeline scheduling."
+            )
         self._model = model[0] if isinstance(model, list) else model
 
     # ── rollout ───────────────────────────────────────────────────────────────
@@ -51,7 +57,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
         unconcat_tokens = batch["unconcat_tokens"]
 
         student_logits = extract_student_responses(logits, args, batch)
-        teacher_inputs, counts, cand_scores, cand_tokens = build_teacher_inputs(
+        q_inputs, conf_inputs, trace_tokens_flat, counts, cand_scores, cand_tokens = build_teacher_inputs(
             batch, metadata_list, unconcat_tokens, self._tokenizer
         )
         if not any(n > 0 for n in counts):
@@ -61,7 +67,9 @@ class OPSDPlugin(metaclass=SingletonMeta):
             args,
             batch,
             student_logits,
-            teacher_inputs,
+            q_inputs,
+            conf_inputs,
+            trace_tokens_flat,
             counts,
             cand_scores,
             cand_tokens,

@@ -9,11 +9,37 @@ No separate teacher model — the training model itself is used for teacher infe
 1. **Rollout**: Sample K trajectories per prompt from the current policy.
 2. **Filter**: Keep correct traces `B_x = {τ | R(x, τ) = 1}`.
 3. **Quality score**: `s(τ) = 1 - η_l·len/L - η_f·format + η_c·conf`.
-4. **TopK_b**: Retain top-K_b candidates by full quality score.
+   `conf = (1/|τ|) Σ_t log π_θ(τ_t | x, τ_<t)` from a dedicated forward over
+   `chat(x) + τ_k` (metho.md §4).
+4. **TopK_b**: Retain top-K_b candidates by full quality score, applied *before*
+   the q-teacher forward so discarded candidates are not run through the
+   expensive q-forward.
 5. **Diversity**: Select N traces `P_x` via k-center greedy (unigram-JSD or token-JSD).
 6. **Teacher**: `q_k^t = π_θ(·| x, τ_k, y_{<t})` — same weights, privileged context.
 7. **Weights**: `w_k^t ∝ exp(-β·Δ_k^t - γ·h_k^t + ρ·g_k^t)`.
 8. **Distill**: `L = KL(Σ_k w_k^t q_k^t ‖ p_θ^t)`.
+
+## Constraints
+
+- Requires `--pipeline-model-parallel-size 1`. The teacher and conf forwards
+  call `model(...)` directly, bypassing pipeline scheduling.
+
+## Performance notes
+
+- Per privileged candidate the plugin runs **two** teacher forwards: one over
+  `chat(x) + τ_k` for Conf (§4), one over `chat(privileged(x, τ_k)) + y` for
+  `q_k^t` (§6). Conf results are cached per rollout group, so within a group
+  of `n_samples_per_prompt` samples Conf is computed once and reused.
+- Setting `--opsd-kb < --opsd-k` cuts q-forward cost proportionally: the
+  TopK_b filter runs between the (cheap) Conf forward and the (expensive)
+  q-forward, so discarded candidates never reach the q-forward.
+- With `--opsd-diversity-metric unigram_jsd` (token-only distance), the
+  diversity selection happens BEFORE the q-forward and q-forward runs only on
+  the N selected traces — saving (K_b - N) full q-forwards per sample.
+  metho.md §5 recommends token_jsd, but the unigram approximation is much
+  cheaper and is the default in the provided scripts.
+- q_mix is built with GPU-side softmax over the full vocab (peak GPU delta
+  ≈ [chunk, V_full] float32 ≈ 150 MB at chunk=256, V=152k).
 
 ## Files
 
