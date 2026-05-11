@@ -38,7 +38,16 @@ class OPSDPlugin(metaclass=SingletonMeta):
         self._tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
 
     def before_train_step_hook(
-        self, args, rollout_id, step_id, model, optimizer, opt_param_scheduler, slime_actor
+        self,
+        args,
+        rollout_id,
+        step_id,
+        model,
+        optimizer,
+        opt_param_scheduler,
+        data_iterator,
+        num_microbatches,
+        slime_actor,
     ) -> None:
         from megatron.core.parallel_state import get_pipeline_model_parallel_world_size
 
@@ -53,14 +62,13 @@ class OPSDPlugin(metaclass=SingletonMeta):
             )
         self._model = model[0] if isinstance(model, list) else model
         self._actor = slime_actor
-        if args.opsd_freeze_teacher:
-            assert "teacher" in self._actor.weights_backuper.backup_tags, (
-                "OPSD: --opsd-freeze-teacher set but no 'teacher' tag was snapshotted; "
-                "the actor init should have produced one."
-            )
-        # New rollout ⇒ new privileged traces ⇒ old Conf cache is dead.  Drop it
-        # at the start of step 0 to bound memory and avoid stale id() collisions
-        # when Python reuses list ids across rollouts.
+        # data_iterator / num_microbatches are accepted for the upcoming path-B
+        # implementation (precompute teacher outputs in this hook with the
+        # frozen teacher loaded). The in-loss swap that was tried first bumps
+        # parameter version counters inside Megatron's autograd window and
+        # trips the SavedVariable version check during backward, so it has
+        # been removed; the frozen-teacher path is currently inert.
+        del data_iterator, num_microbatches
         if step_id == 0:
             self._conf_cache.clear()
 
@@ -91,29 +99,30 @@ class OPSDPlugin(metaclass=SingletonMeta):
         if not any(n > 0 for n in counts):
             return base_loss, metrics
 
-        # Paper §4.1: teacher == initial policy.  Swap to the frozen teacher snapshot
-        # around the teacher forwards, restore the actor before returning so the
-        # autograd backward (which runs after we return) sees student weights.
-        if args.opsd_freeze_teacher:
-            assert self._actor is not None, "OPSD: before_train_step_hook did not register the actor"
-            self._actor.switch_model("teacher")
-        try:
-            opsd_kl, opsd_metrics = distillation_loss(
-                args,
-                batch,
-                student_logits,
-                q_inputs,
-                conf_inputs,
-                trace_tokens_flat,
-                counts,
-                cand_scores,
-                cand_tokens,
-                self._model,
-                conf_cache=self._conf_cache,
-            )
-        finally:
-            if args.opsd_freeze_teacher:
-                self._actor.switch_model("actor")
+        # NOTE: the frozen-teacher swap (path A: swap weights inside this loss
+        # function) was removed because `weights_backuper.restore` does an
+        # in-place `param.copy_()`, which increments the storage version
+        # counter. Autograd captured the student weight at version V during
+        # the outer forward; backward then sees version V+2 and aborts with
+        # "one of the variables needed for gradient computation has been
+        # modified by an inplace operation". Path B (precompute teacher
+        # outputs in `before_train_step_hook`, fully outside the autograd
+        # window) will replace this once wired. For now teacher forwards run
+        # against the current student weights — set `--no-opsd-freeze-teacher`
+        # in scripts to match this behavior and skip the unused snapshot.
+        opsd_kl, opsd_metrics = distillation_loss(
+            args,
+            batch,
+            student_logits,
+            q_inputs,
+            conf_inputs,
+            trace_tokens_flat,
+            counts,
+            cand_scores,
+            cand_tokens,
+            self._model,
+            conf_cache=self._conf_cache,
+        )
 
         total_loss = base_loss + args.opsd_alpha * opsd_kl
         metrics.update({"opsd_kl": opsd_kl.detach(), "opsd_total": total_loss.detach()})

@@ -400,7 +400,15 @@ def train_one_step(
 
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(
-            args, rollout_id, step_id, model, optimizer, opt_param_scheduler, slime_actor=slime_actor
+            args,
+            rollout_id,
+            step_id,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            data_iterator=data_iterator,
+            num_microbatches=num_microbatches,
+            slime_actor=slime_actor,
         )
 
     def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[

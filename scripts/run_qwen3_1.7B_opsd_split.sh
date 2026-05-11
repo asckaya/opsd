@@ -82,6 +82,9 @@ OPSD_ARGS=(
    --opsd-weight-top-k 512
    --opsd-diversity-metric unigram_jsd  # see run_qwen3_1.7B_opsd.sh for rationale
    --opsd-diversity-top-k 128
+   --no-opsd-freeze-teacher   # path-A in-loss swap is currently inert; pin
+                              # to the sync-with-student teacher until path B
+                              # (precompute in before_train_step_hook) lands.
 )
 
 # Performance & Parallelism — actor side
@@ -155,7 +158,7 @@ ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-s
 
 # Submit Job — note: NO --colocate, and the actor/rollout GPU splits are 4/4.
 ray job submit --address="http://127.0.0.1:8088" \
-   --runtime-env-json='{"env_vars": {"CUDA_DEVICE_MAX_CONNECTIONS": "1"}}' \
+   --runtime-env-json='{"env_vars": {"CUDA_DEVICE_MAX_CONNECTIONS": "1", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}}' \
    -- python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 4 \
