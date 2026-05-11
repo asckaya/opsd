@@ -109,16 +109,27 @@ def teacher_forward(
         logits_cpu: per-trace [T, V] float32 tensors on CPU.
         confs:      per-trace mean token log-prob at resp_tokens positions.
     """
+    from megatron.core.parallel_state import get_tensor_model_parallel_world_size
+    tp_size = get_tensor_model_parallel_world_size()
+
     device = inputs[0].device
     resp_t = resp_tokens.to(device=device, dtype=torch.long)  # [T]
     logits_cpu: list[torch.Tensor] = []
     confs: list[float] = []
 
     for inp in inputs:
+        orig_len = inp.size(0)
+        # Sequence parallel requires seq_len % tp_size == 0.  Right-pad with zeros;
+        # causal attention means real positions are unaffected by the tail padding.
+        pad_len = (-orig_len) % tp_size
+        inp_model = F.pad(inp, (0, pad_len)) if pad_len else inp
+
         with torch.no_grad():
-            out = model(input_ids=inp.unsqueeze(0), position_ids=None, attention_mask=None, labels=None)
+            out = model(input_ids=inp_model.unsqueeze(0), position_ids=None, attention_mask=None, labels=None)
+        del inp_model
         raw = out[0] if isinstance(out, tuple) else out
-        logit_t = raw[0, -resp_len:].float()  # [T, V]
+        # Slice original (non-padded) response positions; padding is at the tail.
+        logit_t = raw[0, orig_len - resp_len : orig_len].float()  # [T, V]
         del out, raw
 
         lse = torch.logsumexp(logit_t, dim=-1)                          # [T]
@@ -275,10 +286,10 @@ def distillation_loss(
     """Compute OPSD KL loss over the batch (metho.md §6-9).
 
     Teacher logits are never assembled as [N, T, V] on GPU.  Each trace is
-    processed one at a time; [T, V] tensors are kept on CPU and moved to GPU
-    only two at a time (diversity) or one at a time (q_mix accumulation).
-    Peak GPU delta per sample is ~4 GB regardless of N.
+    processed one at a time; [T, V] tensors are kept on CPU and loaded in
+    _CHUNK_T-row slices for q_mix and KL so peak GPU delta ≈ q_mix + 2×chunk.
     """
+    _CHUNK_T = 256  # token-position chunk; each slice ≈ 147 MB for Qwen3-1.7B
     device = student_logits[0].device
     total_kl = torch.tensor(0.0, device=device)
     valid = 0
@@ -313,32 +324,42 @@ def distillation_loss(
         # §7 — mixture weights over student's top-K gathered teacher logits [N, T, K]
         top_k = min(args.opsd_weight_top_k, V)
         _, weight_idx = torch.topk(p_student / args.opsd_temperature, k=top_k, dim=-1)  # [T, K]
-        q_gathered = torch.stack(
-            [l.to(device).gather(-1, weight_idx) for l in sel_logits], dim=0
-        )  # [N, T, K] — small: N*T*K*4 bytes
+        gathered_list: list[torch.Tensor] = []
+        for l in sel_logits:
+            l_dev = l.to(device)
+            gathered_list.append(l_dev.gather(-1, weight_idx))  # [T, K]
+            del l_dev
+        q_gathered = torch.stack(gathered_list, dim=0)           # [N, T, K]
+        del gathered_list
         w = mixture_weights(args, p_student, q_gathered, weight_idx)  # [N, T]
         del q_gathered, weight_idx
 
-        # §8 — mixture teacher: accumulate q_mix = Σ_k w_k * softmax(q_k) one trace at a time
+        # §8 — q_mix = Σ_k w_k * softmax(q_k); chunked over T, peak ≈ q_mix + 2×[chunk,V]
         q_mix = torch.zeros(T, V, dtype=torch.float32, device=device)
         for k, l_cpu in enumerate(sel_logits):
-            l_k = l_cpu.to(device)                     # [T, V]
-            soft_k = F.softmax(l_k, dim=-1)            # [T, V]
-            del l_k
-            soft_k.mul_(w[k].unsqueeze(-1))            # in-place weight
-            q_mix.add_(soft_k)                         # in-place accumulate
-            del soft_k
-            torch.cuda.empty_cache()
+            w_k = w[k]  # [T]
+            for t0 in range(0, T, _CHUNK_T):
+                t1 = min(t0 + _CHUNK_T, T)
+                l_c = l_cpu[t0:t1].to(device)          # [chunk, V]
+                s_c = F.softmax(l_c, dim=-1)            # [chunk, V]
+                del l_c
+                s_c.mul_(w_k[t0:t1].unsqueeze(-1))     # in-place weight
+                q_mix[t0:t1].add_(s_c)                  # in-place accumulate
+                del s_c
         del sel_logits, w
 
-        # §9 — KL(q_mix ‖ p_θ); computed with explicit intermediates to bound peak memory
-        log_q_mix = q_mix.clamp(min=1e-10)
-        log_q_mix.log_()                               # [T, V], in-place
-        log_p = F.log_softmax(p_student, dim=-1)       # [T, V]
-        log_q_mix.sub_(log_p)                          # in-place: log_q - log_p
-        del log_p
-        kl = (q_mix * log_q_mix).sum(-1)               # [T]
-        del log_q_mix, q_mix
+        # §9 — KL(q_mix ‖ p_θ); chunked over T, peak ≈ q_mix + 2×[chunk,V]
+        kl = torch.zeros(T, device=device)
+        for t0 in range(0, T, _CHUNK_T):
+            t1 = min(t0 + _CHUNK_T, T)
+            qc = q_mix[t0:t1]                               # view [chunk, V]
+            log_q = qc.clamp(min=1e-10).log()               # [chunk, V]
+            log_p = F.log_softmax(p_student[t0:t1], dim=-1) # [chunk, V]
+            log_q.sub_(log_p)                               # in-place: log_q -= log_p
+            del log_p
+            kl[t0:t1] = (qc * log_q).sum(-1)
+            del log_q
+        del q_mix
 
         if args.opsd_jsd_token_clip is not None:
             kl = kl.clamp(max=args.opsd_jsd_token_clip)
