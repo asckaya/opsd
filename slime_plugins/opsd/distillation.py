@@ -11,6 +11,8 @@ Steps executed inside the loss function:
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -242,11 +244,40 @@ def add_conf(
 
     Conf(τ) = (1/|τ|) Σ_t log π_T(τ_t | x, τ_<t) — the teacher's mean log-prob
     on the trace itself, pre-computed by `compute_trace_confs` per metho.md §4.
+
+    Raw Conf is in log-prob units (typically -5..-1 nats), incommensurable with
+    the structural terms which live in [0, 1]. We normalize Conf across the
+    candidates of a single sample so η_c becomes dimensionless and easier to
+    tune. Modes:
+
+      - raw    : no normalization (legacy behavior).
+      - zscore : (c - mean) / std         — centered, unit variance.
+      - minmax : (c - min) / (max - min)  — mapped to [0, 1].
+      - rank   : argsort-rank / (n - 1)   — robust to outliers, in [0, 1].
     """
     if args.opsd_quality_conf_weight == 0.0:
         return base_scores
     w = args.opsd_quality_conf_weight
-    return [b + w * c for b, c in zip(base_scores, confs, strict=True)]
+    mode = args.opsd_quality_conf_norm
+    n = len(confs)
+    if mode == "raw" or n <= 1:
+        norm = list(confs)
+    elif mode == "zscore":
+        arr = np.asarray(confs, dtype=np.float64)
+        std = float(arr.std())
+        norm = ((arr - arr.mean()) / (std if std > 1e-8 else 1.0)).tolist()
+    elif mode == "minmax":
+        arr = np.asarray(confs, dtype=np.float64)
+        lo, hi = float(arr.min()), float(arr.max())
+        norm = ((arr - lo) / (hi - lo)).tolist() if hi - lo > 1e-8 else [0.5] * n
+    elif mode == "rank":
+        order = np.argsort(np.asarray(confs))
+        ranks = np.empty(n, dtype=np.float64)
+        ranks[order] = np.arange(n, dtype=np.float64)
+        norm = (ranks / (n - 1)).tolist()
+    else:
+        raise ValueError(f"Unknown opsd_quality_conf_norm: {mode}")
+    return [b + w * c for b, c in zip(base_scores, norm, strict=True)]
 
 
 # ── quality: TopK_b filter (§4) ──────────────────────────────────────────────
@@ -292,7 +323,7 @@ def mixture_weights(
     p_student: torch.Tensor,
     q_gathered: torch.Tensor,
     weight_idx: torch.Tensor,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute per-token mixture weights w_k^t (metho.md §7).
 
     w_k^t ∝ exp(-β·Δ_k^t - γ·h_k^t + ρ·g_k^t)
@@ -308,8 +339,16 @@ def mixture_weights(
         p_student:   [T, V] student logits.
         q_gathered:  [N, T, K] teacher logits pre-gathered at weight_idx positions.
         weight_idx:  [T, K] student top-K token indices used for gathering.
+
+    Returns:
+        w:                [N, T] softmax-normalised mixture weights.
+        w_entropy_norm:   [T] per-token normalised entropy H(w_·^t) / log N in
+                          [0, 1].  1 ⇒ uniform over teachers (N traces look
+                          equivalent — diversity selection contributed nothing);
+                          0 ⇒ a single teacher dominates.  Aggregating this over
+                          the batch makes a useful health metric.
     """
-    N, T, K = q_gathered.shape
+    N = q_gathered.size(0)
 
     p_log = F.log_softmax(p_student.gather(-1, weight_idx) / args.opsd_temperature, dim=-1)  # [T, K]
     q_log = F.log_softmax(q_gathered / args.opsd_temperature, dim=-1)  # [N, T, K]
@@ -317,10 +356,19 @@ def mixture_weights(
 
     delta = (q_prob * (q_log - p_log.unsqueeze(0))).sum(-1).clamp(min=0)  # [N, T]
     entropy = -(q_prob * q_log).sum(-1)  # [N, T]
-    diversity = _pairwise_jsd(q_prob, q_log) if N > 1 else torch.zeros(N, T, device=p_student.device)
+    diversity = _pairwise_jsd(q_prob, q_log) if N > 1 else torch.zeros(N, p_log.size(0), device=p_student.device)
 
     logits = -args.opsd_kl_weight * delta - args.opsd_entropy_weight * entropy + args.opsd_diversity_weight * diversity
-    return F.softmax(logits, dim=0)  # [N, T]
+    w = F.softmax(logits, dim=0)  # [N, T]
+
+    if N > 1:
+        log_w = F.log_softmax(logits, dim=0)  # numerically stable
+        w_entropy = -(w * log_w).sum(0).clamp(min=0)  # [T] in nats
+        w_entropy_norm = w_entropy / math.log(N)
+    else:
+        w_entropy_norm = torch.zeros(p_log.size(0), device=p_student.device)
+
+    return w, w_entropy_norm
 
 
 def _pairwise_jsd(q_prob: torch.Tensor, q_log: torch.Tensor) -> torch.Tensor:
@@ -369,6 +417,16 @@ class _VocabParallelKLDiv(torch.autograd.Function):
 
     Backward: d(KL)/d(logit_local) = softmax_local - q_local.
       Saved tensor is [T, V_local] ≈ 360 MB (TP=4), not [T, V_full].
+
+    Per-(position, vocab-entry) pointwise KL clipping (paper §3.2 / Figure 4):
+      When `clip` is provided, each per-entry contribution
+          ℓ_{n,v} = q_v · (log q_v - log p_v)
+      is clipped to `clip` *before* the sum over v.  This down-weights
+      stylistic tokens whose individual KL contribution dominates the
+      sum.  The backward formula generalises to
+          d(KL_clip)/d(logit_u) = s · softmax_u - mask_u · q_u
+      where mask_v = [ℓ_{n,v} < clip] and s = Σ_v mask_v · q_v (per
+      position; requires a TP all-reduce when world_size > 1).
     """
 
     @staticmethod
@@ -378,23 +436,33 @@ class _VocabParallelKLDiv(torch.autograd.Function):
         q_local: torch.Tensor,  # [T, V_local], detached q_mix shard
         tp_group,
         chunk_t: int,
+        clip: float | None,  # per-(pos, vocab) ℓ clipping threshold, or None
     ) -> torch.Tensor:  # [T]
         T, V_local = logit_local.shape
         tp_size = dist.get_world_size(group=tp_group)
+        clip_enabled = clip is not None
 
         # ── TP=1 fast path: no cross-rank reductions, single softmax per chunk ──
         if tp_size == 1:
-            sm_minus_q = logit_local.new_empty(T, V_local)
+            grad_buf = logit_local.new_empty(T, V_local)
             kl = logit_local.new_zeros(T)
             for t0 in range(0, T, chunk_t):
                 t1 = min(t0 + chunk_t, T)
                 lc = logit_local[t0:t1]  # view [c, V]
                 qc = q_local[t0:t1]
                 log_p = F.log_softmax(lc, dim=-1)  # [c, V]
-                kl[t0:t1] = (qc * (qc.clamp(min=1e-10).log() - log_p)).sum(-1)
-                sm_minus_q[t0:t1] = log_p.exp() - qc
-                del lc, qc, log_p
-            ctx.save_for_backward(sm_minus_q)
+                per_entry = qc * (qc.clamp(min=1e-10).log() - log_p)  # [c, V]
+                sm_c = log_p.exp()
+                if clip_enabled:
+                    mask = per_entry < clip  # [c, V]
+                    per_entry = torch.where(mask, per_entry, per_entry.new_full((), clip))
+                    s = (mask.to(qc.dtype) * qc).sum(-1, keepdim=True)  # [c, 1]
+                    grad_buf[t0:t1] = sm_c * s - mask.to(qc.dtype) * qc
+                else:
+                    grad_buf[t0:t1] = sm_c - qc
+                kl[t0:t1] = per_entry.sum(-1)
+                del lc, qc, log_p, sm_c, per_entry
+            ctx.save_for_backward(grad_buf)
             ctx.tp_group = tp_group
             return kl
 
@@ -411,34 +479,80 @@ class _VocabParallelKLDiv(torch.autograd.Function):
             lse[t0:t1] = (gmax + gsum.log()).squeeze(-1)
             del gmax, gsum
 
-        # Phase 2: KL + (softmax - q) buffer
-        sm_minus_q = logit_local.new_empty(T, V_local)  # [T, V_local]
+        # Phase 2: KL + grad buffer.
+        # When clip is enabled we need the global Σ_v mask_v · q_v per position;
+        # accumulate local contributions then all-reduce a single [T] tensor at
+        # the end (per-position, per-rank: cheap).
+        grad_buf = logit_local.new_empty(T, V_local)  # [T, V_local]
         kl_local = logit_local.new_zeros(T)  # [T]
+        s_local = logit_local.new_zeros(T) if clip_enabled else None  # [T]
         for t0 in range(0, T, chunk_t):
             t1 = min(t0 + chunk_t, T)
             lc = logit_local[t0:t1]  # view [c, V_local]
             qc = q_local[t0:t1]  # view [c, V_local]
             log_p = lc - lse[t0:t1].unsqueeze(-1)  # log-softmax [c, V_local]
             sm_c = log_p.exp()  # softmax [c, V_local]
-            kl_local[t0:t1] = (qc * (qc.clamp(min=1e-10).log() - log_p)).sum(-1)
-            sm_minus_q[t0:t1] = sm_c - qc
-            del log_p, sm_c
+            per_entry = qc * (qc.clamp(min=1e-10).log() - log_p)  # [c, V_local]
+            if clip_enabled:
+                assert s_local is not None  # for type checkers
+                mask = per_entry < clip
+                per_entry = torch.where(mask, per_entry, per_entry.new_full((), clip))
+                mask_q = mask.to(qc.dtype) * qc  # [c, V_local]
+                s_local[t0:t1] = mask_q.sum(-1)
+                # grad placeholder: store -mask_q here; combine with s*softmax after all-reduce.
+                grad_buf[t0:t1] = -mask_q
+            else:
+                grad_buf[t0:t1] = sm_c - qc
+            kl_local[t0:t1] = per_entry.sum(-1)
+            del log_p, sm_c, per_entry
         del lse
 
-        # Single all-reduce to sum KL shards across TP ranks
+        # Sum KL shards across TP ranks (one all-reduce of [T]).
         kl = kl_local.clone()
         dist.all_reduce(kl, op=dist.ReduceOp.SUM, group=tp_group)
 
-        ctx.save_for_backward(sm_minus_q)
+        if clip_enabled:
+            assert s_local is not None  # for type checkers
+            # Reduce s to global, then materialise the actual grad buffer.
+            dist.all_reduce(s_local, op=dist.ReduceOp.SUM, group=tp_group)
+            # Rewrite grad_buf in-place: grad = softmax_local * s + (-mask_q already there).
+            # We need softmax_local again; recompute from logit - global_lse cached as
+            # logit_local - (logit_local - log_softmax). Cheaper to recompute lse once
+            # over all T (T is at most a few k, full softmax cost dominated by other paths).
+            # Use the lse we discarded above: re-derive lazily per chunk.
+            # NOTE: this recomputes log_softmax once; the alternative is to save [T, V_local]
+            # of softmax which doubles the saved-for-backward footprint.
+            # Recompute lse (same chunked formula as Phase 1 above, no new comms because
+            # we re-all_reduce gmax/gsum — order N(T) flops, negligible vs the V loop).
+            lse2 = logit_local.new_empty(T)
+            for t0 in range(0, T, chunk_t):
+                t1 = min(t0 + chunk_t, T)
+                c = logit_local[t0:t1]
+                gmax = c.max(dim=-1, keepdim=True).values
+                dist.all_reduce(gmax, op=dist.ReduceOp.MAX, group=tp_group)
+                gsum = (c - gmax).exp().sum(dim=-1, keepdim=True)
+                dist.all_reduce(gsum, op=dist.ReduceOp.SUM, group=tp_group)
+                lse2[t0:t1] = (gmax + gsum.log()).squeeze(-1)
+                del gmax, gsum
+            for t0 in range(0, T, chunk_t):
+                t1 = min(t0 + chunk_t, T)
+                sm_c = (logit_local[t0:t1] - lse2[t0:t1].unsqueeze(-1)).exp()
+                # grad_buf currently holds -mask_q; add softmax * s.
+                grad_buf[t0:t1].add_(sm_c * s_local[t0:t1].unsqueeze(-1))
+                del sm_c
+            del lse2
+
+        ctx.save_for_backward(grad_buf)
         ctx.tp_group = tp_group
         return kl
 
     @staticmethod
     def backward(ctx, grad_kl: torch.Tensor):
-        (sm_minus_q,) = ctx.saved_tensors
-        # d(KL)/d(logit_local) = softmax_local - q_local
-        grad = grad_kl.unsqueeze(-1) * sm_minus_q  # [T, V_local]
-        return grad, None, None, None
+        (grad_buf,) = ctx.saved_tensors
+        # Unclipped: grad_buf = softmax_local - q_local.
+        # Clipped:   grad_buf = softmax_local * s - mask * q_local.
+        grad = grad_kl.unsqueeze(-1) * grad_buf  # [T, V_local]
+        return grad, None, None, None, None
 
 
 # ── KL distillation loss (§8-9) ───────────────────────────────────────────────
@@ -455,7 +569,7 @@ def distillation_loss(
     cand_scores: list[list[float]],
     cand_tokens: list[list[list[int]]],
     model: torch.nn.Module,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute OPSD KL loss over the batch (metho.md §4, §6-9).
 
     Student logits stay vocab-parallel [T, V_local] throughout; no full-vocab
@@ -472,7 +586,18 @@ def distillation_loss(
 
     §9 KL is computed by _VocabParallelKLDiv, a custom autograd Function whose
     backward gradient d(KL)/d(logit_local) = softmax_local - q_local uses only
-    the [T, V_local] saved buffer, not [T, V_full].
+    the [T, V_local] saved buffer, not [T, V_full].  Per-(position, vocab-entry)
+    pointwise clipping (paper §3.2) is enabled by `args.opsd_pointwise_kl_clip`.
+
+    Returns:
+        loss:    scalar tensor — the per-sample-averaged distillation KL.
+        metrics: dict of detached scalar tensors for logging, currently:
+                   `opsd_w_entropy` — mean over (sample × token) of the
+                   normalised mixture-weight entropy H(w_·^t) / log N in [0,1].
+                   Close to 1 ⇒ N teacher traces look near-equivalent and the
+                   softmax over them is ~uniform (diversity selection is not
+                   providing distinct signal); close to 0 ⇒ a single teacher
+                   dominates each position.
     """
     from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_model_parallel_rank
 
@@ -482,6 +607,8 @@ def distillation_loss(
 
     device = student_logits[0].device
     total_kl = torch.tensor(0.0, device=device)
+    w_entropy_sum = torch.tensor(0.0, device=device)
+    w_entropy_count = 0
     valid = 0
     offset = 0
     # Same rollout group shares privileged candidates (same problem, same τ set),
@@ -553,7 +680,7 @@ def distillation_loss(
             gathered_list.append(l_shard.gather(-1, weight_idx))  # [T, K]
         q_gathered = torch.stack(gathered_list, dim=0)  # [N, T, K]
         del gathered_list
-        w = mixture_weights(args, p_student, q_gathered, weight_idx)  # [N, T]
+        w, w_entropy_norm = mixture_weights(args, p_student, q_gathered, weight_idx)  # [N, T], [T]
         del q_gathered, weight_idx
 
         # §8 — q_mix for this TP rank's vocab shard [T, V_local].
@@ -575,7 +702,9 @@ def distillation_loss(
 
         # §9 — KL(q_mix ‖ p_θ) via vocab-parallel custom autograd.
         # Backward memory = [T, V_local] saved buffer ≈ 360 MB (TP=4).
-        kl = _VocabParallelKLDiv.apply(p_student, q_mix_local.detach(), tp_group, _CHUNK_T)
+        kl = _VocabParallelKLDiv.apply(
+            p_student, q_mix_local.detach(), tp_group, _CHUNK_T, args.opsd_pointwise_kl_clip
+        )
         del q_mix_local
 
         if args.opsd_jsd_token_clip is not None:
@@ -585,13 +714,21 @@ def distillation_loss(
         if loss_masks is not None:
             mask = loss_masks[i]
             total_kl += (kl * mask).sum() / mask.sum().clamp(min=1)
+            w_entropy_sum += (w_entropy_norm * mask).sum()
+            w_entropy_count += int(mask.sum().clamp(min=1).item())
         else:
             total_kl += kl.mean()
+            w_entropy_sum += w_entropy_norm.sum()
+            w_entropy_count += int(w_entropy_norm.numel())
         valid += 1
 
     if valid == 0:
-        return total_kl
-    return total_kl / valid
+        return total_kl, {}
+    loss = total_kl / valid
+    metrics: dict[str, torch.Tensor] = {}
+    if w_entropy_count > 0:
+        metrics["opsd_w_entropy"] = (w_entropy_sum / w_entropy_count).detach()
+    return loss, metrics
 
 
 # ── student response extraction ───────────────────────────────────────────────

@@ -76,10 +76,22 @@ See `scripts/run_qwen3_1.7B_opsd.sh` for a complete example.
 | `--opsd-diversity-weight` | 0.5 | Mixture weight ρ (diversity term) |
 | `--opsd-temperature` | 1.0 | Temperature for weight computation |
 | `--opsd-weight-top-k` | 512 | Vocab truncation for weight computation |
-| `--opsd-jsd-token-clip` | — | Per-token KL clip value |
+| `--opsd-jsd-token-clip` | — | Per-position KL clamp (post-sum over vocab) |
+| `--opsd-pointwise-kl-clip` | — | Per-(position, vocab-entry) ℓ_{n,v} cap (paper §3.2 Figure 4). Prevents stylistic tokens from dominating; recommended for runs longer than ~50 steps |
 | `--opsd-fallback-to-gt` | false | Use GT trace when B_x is empty |
 | `--opsd-quality-len-weight` | 0.1 | η_l: length penalty |
 | `--opsd-quality-format-weight` | 0.2 | η_f: format penalty |
 | `--opsd-quality-conf-weight` | 0.5 | η_c: confidence weight |
+| `--opsd-quality-conf-norm` | `rank` | How to normalize Conf across a sample's candidates: `raw`/`zscore`/`minmax`/`rank` |
 | `--opsd-diversity-metric` | `token_jsd` | `token_jsd` or `unigram_jsd` |
 | `--opsd-diversity-top-k` | 128 | Vocab truncation for token-JSD diversity |
+
+## Logged metrics
+
+In addition to base policy-loss metrics, the OPSD plugin emits:
+
+| Metric | Meaning |
+|---|---|
+| `opsd_kl` | Per-sample-averaged KL(q_mix ‖ p_θ) — the OPSD distillation loss |
+| `opsd_total` | `base_loss + α · opsd_kl` |
+| `opsd_w_entropy` | Mean over (sample, token) of H(w_·^t) / log N ∈ [0, 1]. Near 1 ⇒ the N selected teachers are near-equivalent and the mixture is ~uniform (diversity selection is providing little distinct signal — consider lowering N, raising `--opsd-diversity-weight`, or switching the diversity metric). Near 0 ⇒ a single teacher dominates each position |

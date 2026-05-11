@@ -1357,6 +1357,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument("--opsd-jsd-token-clip", type=float, default=None, help="Clip JSD per token")
             parser.add_argument(
+                "--opsd-pointwise-kl-clip",
+                type=float,
+                default=None,
+                help=(
+                    "Per-(position, vocab-entry) KL contribution cap (paper §3.2). "
+                    "Each term ℓ_{n,v} = q_v · (log q_v - log p_v) is clipped to this "
+                    "value before summing over v; prevents stylistic tokens from dominating "
+                    "the distillation signal. None disables clipping."
+                ),
+            )
+            parser.add_argument(
                 "--opsd-fallback-to-gt",
                 action=argparse.BooleanOptionalAction,
                 default=True,
@@ -1379,6 +1390,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=0.5,
                 help="Quality score confidence reward weight (eta_c)",
+            )
+            parser.add_argument(
+                "--opsd-quality-conf-norm",
+                type=str,
+                choices=["raw", "zscore", "minmax", "rank"],
+                default="rank",
+                help=(
+                    "Normalize Conf(τ) across a sample's candidates before adding to the "
+                    "quality score. `raw` uses the unnormalized log-prob (legacy); `rank` "
+                    "is recommended — robust to outliers and makes eta_c dimensionless."
+                ),
             )
             parser.add_argument(
                 "--opsd-diversity-metric",

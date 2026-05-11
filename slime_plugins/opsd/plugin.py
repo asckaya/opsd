@@ -63,7 +63,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
         if not any(n > 0 for n in counts):
             return base_loss, metrics
 
-        opsd_kl = distillation_loss(
+        opsd_kl, opsd_metrics = distillation_loss(
             args,
             batch,
             student_logits,
@@ -77,4 +77,5 @@ class OPSDPlugin(metaclass=SingletonMeta):
         )
         total_loss = base_loss + args.opsd_alpha * opsd_kl
         metrics.update({"opsd_kl": opsd_kl.detach(), "opsd_total": total_loss.detach()})
+        metrics.update(opsd_metrics)
         return total_loss, metrics
