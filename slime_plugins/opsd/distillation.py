@@ -96,46 +96,41 @@ def teacher_forward(
     model: torch.nn.Module,
     inputs: list[torch.Tensor],
     resp_len: int,
-    pad_id: int,
-    chunk_size: int = 1,
-) -> torch.Tensor:
-    """Run π_θ(·| x, τ_k, y_{<t}) in no_grad using the current training model.
+    resp_tokens: torch.Tensor,
+) -> tuple[list[torch.Tensor], list[float]]:
+    """Run π_θ(·| x, τ_k, y_{<t}) one trace at a time; offload logits to CPU.
 
-    Processes inputs in chunks to bound peak memory.  The full logit tensor
-    [N, max_len, vocab] is produced by Megatron in fp32 — for Qwen3-1.7B with
-    N=16 and max_len≈2400 this is ~23 GB, which OOMs a training GPU.
-    By chunking to chunk_size=1 we cap the allocation at ~2.4 GB per chunk.
-
-    Args:
-        model:      Training model (DDP-wrapped Megatron GPTModel).
-        inputs:     List of [prompt_with_priv_context + response] token tensors.
-        resp_len:   Response length; only the last resp_len logit positions are kept.
-        pad_id:     Token id used for right-padding within each chunk.
-        chunk_size: Traces per forward pass.  Lower = less peak memory.
+    Processing one trace at a time avoids materialising [N, T, V] on GPU.
+    Megatron's float16_to_fp32 produces a full [1, seq, vocab] fp32 tensor per
+    forward pass (~1.4 GB for Qwen3-1.7B at T≈2400); it is sliced to [T, V],
+    conf is computed on GPU, then the tensor moves to CPU before the next pass.
 
     Returns:
-        [N, resp_len, V] float32 logits.
+        logits_cpu: per-trace [T, V] float32 tensors on CPU.
+        confs:      per-trace mean token log-prob at resp_tokens positions.
     """
     device = inputs[0].device
-    chunks: list[torch.Tensor] = []
+    resp_t = resp_tokens.to(device=device, dtype=torch.long)  # [T]
+    logits_cpu: list[torch.Tensor] = []
+    confs: list[float] = []
 
-    for start in range(0, len(inputs), chunk_size):
-        batch = inputs[start : start + chunk_size]
-        max_len = max(t.size(0) for t in batch)
-        padded = torch.stack([
-            F.pad(t, (0, max_len - t.size(0)), value=pad_id) for t in batch
-        ]).to(device)
-
+    for inp in inputs:
         with torch.no_grad():
-            out = model(input_ids=padded, position_ids=None, attention_mask=None, labels=None)
-        del padded
-
+            out = model(input_ids=inp.unsqueeze(0), position_ids=None, attention_mask=None, labels=None)
         raw = out[0] if isinstance(out, tuple) else out
-        chunks.append(raw[:, -resp_len:].float())  # slice immediately; free the rest
+        logit_t = raw[0, -resp_len:].float()  # [T, V]
         del out, raw
+
+        lse = torch.logsumexp(logit_t, dim=-1)                          # [T]
+        at_resp = logit_t[torch.arange(resp_len, device=device), resp_t]  # [T]
+        confs.append((at_resp - lse).mean().item())
+        del lse, at_resp
+
+        logits_cpu.append(logit_t.cpu())
+        del logit_t
         torch.cuda.empty_cache()
 
-    return torch.cat(chunks, dim=0)  # [N, resp_len, V]
+    return logits_cpu, confs
 
 
 # ── quality: conf term (§4) ──────────────────────────────────────────────────
@@ -144,26 +139,16 @@ def teacher_forward(
 def add_conf(
     args,
     base_scores: list[float],
-    q_teachers: torch.Tensor,
-    resp_tokens: torch.Tensor,
+    confs: list[float],
 ) -> list[float]:
     """Add η_c·Conf(τ) to structural quality scores.
 
-    Conf is approximated as the teacher's mean token log-probability over the
-    student response y, conditioned on privileged trace τ:
-      Conf(τ) ≈ (1/T) Σ_t log π_θ(y_t | x, τ, y_{<t})
+    Conf(τ) ≈ (1/T) Σ_t log π_θ(y_t | x, τ, y_{<t}) — pre-computed per trace.
     """
     if args.opsd_quality_conf_weight == 0.0:
         return base_scores
-
-    # q_teachers: [N, T, V],  resp_tokens: [T]
-    target = resp_tokens.to(device=q_teachers.device, dtype=torch.long)
-    gathered = q_teachers.gather(-1, target[None, :, None].expand(len(base_scores), -1, 1)).squeeze(-1)
-    log_probs = gathered - torch.logsumexp(q_teachers, dim=-1)  # [N, T] log-softmax
-    conf = log_probs.mean(dim=-1).tolist()  # [N]
-
     w = args.opsd_quality_conf_weight
-    return [b + w * c for b, c in zip(base_scores, conf, strict=True)]
+    return [b + w * c for b, c in zip(base_scores, confs, strict=True)]
 
 
 # ── quality: TopK_b filter (§4) ──────────────────────────────────────────────
@@ -171,15 +156,15 @@ def add_conf(
 
 def topk_filter(
     k_b: int,
-    q_teachers: torch.Tensor,
+    logits_cpu: list[torch.Tensor],
     tokens: list[list[int]],
     scores: list[float],
-) -> tuple[torch.Tensor, list[list[int]], list[float]]:
+) -> tuple[list[torch.Tensor], list[list[int]], list[float]]:
     """Keep top-K_b candidates by full quality score."""
     if k_b <= 0 or len(scores) <= k_b:
-        return q_teachers, tokens, scores
+        return logits_cpu, tokens, scores
     top_idx = np.argsort(scores)[-k_b:].tolist()
-    return q_teachers[top_idx], [tokens[j] for j in top_idx], [scores[j] for j in top_idx]
+    return [logits_cpu[j] for j in top_idx], [tokens[j] for j in top_idx], [scores[j] for j in top_idx]
 
 
 # ── diversity selection (§5) ─────────────────────────────────────────────────
@@ -189,7 +174,8 @@ def select_diverse(
     args,
     scores: list[float],
     tokens: list[list[int]],
-    q_teachers: torch.Tensor,
+    logits_cpu: list[torch.Tensor],
+    device: torch.device,
 ) -> list[int]:
     """Select N diverse candidates via k-center greedy (metho.md §5)."""
     n_select = min(args.opsd_n, len(scores))
@@ -197,7 +183,7 @@ def select_diverse(
         return list(range(len(scores)))
 
     if args.opsd_diversity_metric == "token_jsd":
-        dist = pairwise_seq_jsd(q_teachers, args.opsd_diversity_top_k)
+        dist = pairwise_seq_jsd(logits_cpu, args.opsd_diversity_top_k, device)
     else:
         dist = pairwise_unigram_jsd(tokens)
 
@@ -207,7 +193,12 @@ def select_diverse(
 # ── mixture weights (§7) ─────────────────────────────────────────────────────
 
 
-def mixture_weights(args, p_student: torch.Tensor, q_teachers: torch.Tensor) -> torch.Tensor:
+def mixture_weights(
+    args,
+    p_student: torch.Tensor,
+    q_gathered: torch.Tensor,
+    weight_idx: torch.Tensor,
+) -> torch.Tensor:
     """Compute per-token mixture weights w_k^t (metho.md §7).
 
     w_k^t ∝ exp(-β·Δ_k^t - γ·h_k^t + ρ·g_k^t)
@@ -218,16 +209,16 @@ def mixture_weights(args, p_student: torch.Tensor, q_teachers: torch.Tensor) -> 
       g_k^t = mean_j JSD(q_k^t, q_j^t) — diversity bonus
 
     All computed on the student's top-K vocabulary for efficiency.
+
+    Args:
+        p_student:   [T, V] student logits.
+        q_gathered:  [N, T, K] teacher logits pre-gathered at weight_idx positions.
+        weight_idx:  [T, K] student top-K token indices used for gathering.
     """
-    N, T, V = q_teachers.shape
-    top_k = min(args.opsd_weight_top_k, V)
+    N, T, K = q_gathered.shape
 
-    # Student top-k tokens as shared vocabulary
-    _, idx = torch.topk(p_student / args.opsd_temperature, k=top_k, dim=-1)   # [T, K]
-
-    p_log = F.log_softmax(p_student.gather(-1, idx) / args.opsd_temperature, dim=-1)  # [T, K]
-    q_gathered = q_teachers.gather(-1, idx.unsqueeze(0).expand(N, -1, -1))             # [N, T, K]
-    q_log = F.log_softmax(q_gathered / args.opsd_temperature, dim=-1)                  # [N, T, K]
+    p_log = F.log_softmax(p_student.gather(-1, weight_idx) / args.opsd_temperature, dim=-1)  # [T, K]
+    q_log = F.log_softmax(q_gathered / args.opsd_temperature, dim=-1)                         # [N, T, K]
     q_prob = q_log.exp()
 
     delta = (q_prob * (q_log - p_log.unsqueeze(0))).sum(-1).clamp(min=0)   # [N, T]
@@ -280,9 +271,14 @@ def distillation_loss(
     cand_scores: list[list[float]],
     cand_tokens: list[list[list[int]]],
     model: torch.nn.Module,
-    pad_id: int,
 ) -> torch.Tensor:
-    """Compute OPSD KL loss over the batch (metho.md §6-9)."""
+    """Compute OPSD KL loss over the batch (metho.md §6-9).
+
+    Teacher logits are never assembled as [N, T, V] on GPU.  Each trace is
+    processed one at a time; [T, V] tensors are kept on CPU and moved to GPU
+    only two at a time (diversity) or one at a time (q_mix accumulation).
+    Peak GPU delta per sample is ~4 GB regardless of N.
+    """
     device = student_logits[0].device
     total_kl = torch.tensor(0.0, device=device)
     valid = 0
@@ -295,27 +291,54 @@ def distillation_loss(
         resp_len = int(batch["response_lengths"][i])
         p_student = student_logits[i]                           # [T, V]
         resp_tokens = batch["unconcat_tokens"][i][-resp_len:]   # [T]
+        T, V = p_student.shape
 
-        # §6 — teacher logits for all n candidates
-        q_t = teacher_forward(model, teacher_inputs[offset : offset + n], resp_len, pad_id)
-        offset += n  # [n, T, V]
+        # §6 — teacher forward: one trace at a time, returns CPU tensors + confs
+        logits_cpu, confs = teacher_forward(
+            model, teacher_inputs[offset : offset + n], resp_len, resp_tokens
+        )
+        offset += n
 
         # §4 — full quality score + TopK_b
-        scores = add_conf(args, cand_scores[i], q_t, resp_tokens)
-        q_t, tokens_i, scores = topk_filter(args.opsd_kb, q_t, cand_tokens[i], scores)
+        scores = add_conf(args, cand_scores[i], confs)
+        logits_cpu, tokens_i, scores = topk_filter(args.opsd_kb, logits_cpu, cand_tokens[i], scores)
 
-        # §5 — k-center greedy diversity selection
-        sel = select_diverse(args, scores, tokens_i, q_t)
-        q_t = q_t[sel]  # [N, T, V]
+        # §5 — k-center greedy diversity selection (moves pairs to GPU)
+        sel = select_diverse(args, scores, tokens_i, logits_cpu, device)
+        sel_logits = [logits_cpu[k] for k in sel]  # N CPU tensors [T, V]
+        del logits_cpu
 
-        # §7 — mixture weights
-        w = mixture_weights(args, p_student, q_t)   # [N, T]
+        N_sel = len(sel_logits)
 
-        # §8 — mixture teacher
-        q_mix = (w.unsqueeze(-1) * F.softmax(q_t, dim=-1)).sum(0)  # [T, V]
+        # §7 — mixture weights over student's top-K gathered teacher logits [N, T, K]
+        top_k = min(args.opsd_weight_top_k, V)
+        _, weight_idx = torch.topk(p_student / args.opsd_temperature, k=top_k, dim=-1)  # [T, K]
+        q_gathered = torch.stack(
+            [l.to(device).gather(-1, weight_idx) for l in sel_logits], dim=0
+        )  # [N, T, K] — small: N*T*K*4 bytes
+        w = mixture_weights(args, p_student, q_gathered, weight_idx)  # [N, T]
+        del q_gathered, weight_idx
 
-        # §9 — KL(q_mix ‖ p_θ)
-        kl = (q_mix * (q_mix.clamp(min=1e-10).log() - F.log_softmax(p_student, dim=-1))).sum(-1)
+        # §8 — mixture teacher: accumulate q_mix = Σ_k w_k * softmax(q_k) one trace at a time
+        q_mix = torch.zeros(T, V, dtype=torch.float32, device=device)
+        for k, l_cpu in enumerate(sel_logits):
+            l_k = l_cpu.to(device)                     # [T, V]
+            soft_k = F.softmax(l_k, dim=-1)            # [T, V]
+            del l_k
+            soft_k.mul_(w[k].unsqueeze(-1))            # in-place weight
+            q_mix.add_(soft_k)                         # in-place accumulate
+            del soft_k
+            torch.cuda.empty_cache()
+        del sel_logits, w
+
+        # §9 — KL(q_mix ‖ p_θ); computed with explicit intermediates to bound peak memory
+        log_q_mix = q_mix.clamp(min=1e-10)
+        log_q_mix.log_()                               # [T, V], in-place
+        log_p = F.log_softmax(p_student, dim=-1)       # [T, V]
+        log_q_mix.sub_(log_p)                          # in-place: log_q - log_p
+        del log_p
+        kl = (q_mix * log_q_mix).sum(-1)               # [T]
+        del log_q_mix, q_mix
 
         if args.opsd_jsd_token_clip is not None:
             kl = kl.clamp(max=args.opsd_jsd_token_clip)

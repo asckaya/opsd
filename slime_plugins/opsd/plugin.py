@@ -59,12 +59,9 @@ class OPSDPlugin(metaclass=SingletonMeta):
         if not any(n > 0 for n in counts):
             return base_loss, metrics
 
-        pad_id = self._tokenizer.pad_token_id
-        assert pad_id is not None, "OPSD: tokenizer has no pad_token_id"
-
         opsd_kl = distillation_loss(
             args, batch, student_logits, teacher_inputs, counts, cand_scores, cand_tokens,
-            self._model, pad_id,
+            self._model,
         )
         total_loss = base_loss + args.opsd_alpha * opsd_kl
         metrics.update({"opsd_kl": opsd_kl.detach(), "opsd_total": total_loss.detach()})

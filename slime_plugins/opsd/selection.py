@@ -52,14 +52,26 @@ def pairwise_unigram_jsd(tokens: list[list[int]]) -> np.ndarray:
     return dist
 
 
-def pairwise_seq_jsd(logits: torch.Tensor, top_k: int) -> np.ndarray:
-    """[N, N] matrix of mean-token-JSD distances between logit sequences [N, T, V]."""
-    n = logits.size(0)
+def pairwise_seq_jsd(
+    logits_list: list[torch.Tensor],
+    top_k: int,
+    device: torch.device,
+) -> np.ndarray:
+    """[N, N] matrix of mean-token-JSD distances.
+
+    logits_list: list of [T, V] tensors (CPU); pairs are moved to device one at a time
+    so peak GPU usage is 2 × [T, V] instead of [N, T, V].
+    """
+    n = len(logits_list)
     dist = np.zeros((n, n), dtype=np.float32)
     for i in range(n):
+        li = logits_list[i].to(device)
         for j in range(i + 1, n):
-            d = _seq_jsd(logits[i], logits[j], top_k)
+            lj = logits_list[j].to(device)
+            d = _seq_jsd(li, lj, top_k)
             dist[i, j] = dist[j, i] = d
+            del lj
+        del li
     return dist
 
 
