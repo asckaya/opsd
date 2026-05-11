@@ -68,6 +68,12 @@ def build_teacher_inputs(
     cand_tokens: list[list[list[int]]] = []
     device = unconcat_tokens[0].device
 
+    # Same rollout group shares the privileged-candidates list (identical object
+    # across n_samples_per_prompt samples — see rollout.py). Encoding the chat
+    # template per (sample, trace) wastes 16× the work; cache by list identity.
+    bare_cache: dict[int, list[int]] = {}
+    priv_cache: dict[int, list[list[int]]] = {}
+
     for i, meta in enumerate(metadata_list):
         traces: list[list[int]] = meta["privileged_candidates"]
         scores: list[float] = meta["privileged_candidate_scores"]
@@ -79,21 +85,34 @@ def build_teacher_inputs(
             cand_tokens.append([])
             continue
 
-        resp_tok = unconcat_tokens[i][-batch["response_lengths"][i] :]
-        # Bare chat(problem) — used as the conditioning prefix for Conf(τ_k).
-        bare_prompt_ids = tokenizer.apply_chat_template(
-            [{"role": "user", "content": problem}],
-            tokenize=True,
-            add_generation_prompt=True,
-        )
-        for trace in traces:
-            priv_prompt = _build_privileged_prompt(problem, trace, tokenizer)
-            priv_prompt_ids = tokenizer.apply_chat_template(
-                [{"role": "user", "content": priv_prompt}],
+        resp_tok_list = unconcat_tokens[i][-batch["response_lengths"][i] :].tolist()
+        group_id = id(traces)
+
+        bare_prompt_ids = bare_cache.get(group_id)
+        if bare_prompt_ids is None:
+            bare_prompt_ids = tokenizer.apply_chat_template(
+                [{"role": "user", "content": problem}],
                 tokenize=True,
                 add_generation_prompt=True,
             )
-            q_inputs.append(torch.tensor(priv_prompt_ids + resp_tok.tolist(), device=device))
+            bare_cache[group_id] = bare_prompt_ids
+
+        priv_ids_list = priv_cache.get(group_id)
+        if priv_ids_list is None:
+            priv_ids_list = []
+            for trace in traces:
+                priv_prompt = _build_privileged_prompt(problem, trace, tokenizer)
+                priv_ids_list.append(
+                    tokenizer.apply_chat_template(
+                        [{"role": "user", "content": priv_prompt}],
+                        tokenize=True,
+                        add_generation_prompt=True,
+                    )
+                )
+            priv_cache[group_id] = priv_ids_list
+
+        for k, trace in enumerate(traces):
+            q_inputs.append(torch.tensor(priv_ids_list[k] + resp_tok_list, device=device))
             conf_inputs.append(torch.tensor(bare_prompt_ids + list(trace), device=device))
             trace_tokens_flat.append(torch.tensor(trace, dtype=torch.long, device=device))
 
@@ -117,22 +136,23 @@ def teacher_forward(
     inputs: list[torch.Tensor],
     resp_len: int,
 ) -> list[torch.Tensor]:
-    """Run π_θ(·| x, τ_k, y_{<t}) one trace at a time; offload logits to CPU.
+    """Run π_θ(·| x, τ_k, y_{<t}) one trace at a time; return GPU logits.
 
-    Returns full-vocab teacher logits [resp_len, V_full] per input. q_k^t at
-    position t is taken from logit position prompt_len + t - 1 (causal-LM
-    convention: output[i] predicts input[i+1]), matching the slicing used by
-    slime's own `get_responses` (`logits[start-1 : end-1]`).
+    Returns full-vocab teacher logits [resp_len, V_full] per input, on the same
+    device as the model. q_k^t at position t is taken from logit position
+    prompt_len + t - 1 (causal-LM convention: output[i] predicts input[i+1]),
+    matching the slicing used by slime's own `get_responses`
+    (`logits[start-1 : end-1]`).
 
-    Processing one trace at a time avoids materialising [N, T, V] on GPU.
-    Megatron's float16_to_fp32 produces a full [1, seq, vocab] fp32 tensor per
-    forward pass (~1.4 GB for Qwen3-1.7B at T≈2400); it is sliced to [T, V],
-    moved to CPU, then released before the next pass.
+    Memory note: with N=4 selected traces and Qwen3 (V≈152k), retained GPU
+    memory is N × [T, V] × 4 B ≈ 4.8 GB at T=2048 — fits comfortably alongside
+    the 1.7B model. For very large N or very long responses, switch to
+    `.cpu()` after the slice if memory becomes tight.
     """
     from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_model_parallel_world_size
 
     tp_size = get_tensor_model_parallel_world_size()
-    logits_cpu: list[torch.Tensor] = []
+    teacher_logits: list[torch.Tensor] = []
 
     for inp in inputs:
         orig_len = inp.size(0)
@@ -158,10 +178,9 @@ def teacher_forward(
             torch.distributed.all_gather(shards, logit_t.contiguous(), group=tp_group)
             logit_t = torch.cat(shards, dim=-1)  # [T, V_full]
 
-        logits_cpu.append(logit_t.cpu())
-        del logit_t
+        teacher_logits.append(logit_t)
 
-    return logits_cpu
+    return teacher_logits
 
 
 # ── Conf(τ) forward (§4) ─────────────────────────────────────────────────────
@@ -221,7 +240,8 @@ def add_conf(
 ) -> list[float]:
     """Add η_c·Conf(τ) to structural quality scores.
 
-    Conf(τ) ≈ (1/T) Σ_t log π_θ(y_t | x, τ, y_{<t}) — pre-computed per trace.
+    Conf(τ) = (1/|τ|) Σ_t log π_T(τ_t | x, τ_<t) — the teacher's mean log-prob
+    on the trace itself, pre-computed by `compute_trace_confs` per metho.md §4.
     """
     if args.opsd_quality_conf_weight == 0.0:
         return base_scores
@@ -360,8 +380,26 @@ class _VocabParallelKLDiv(torch.autograd.Function):
         chunk_t: int,
     ) -> torch.Tensor:  # [T]
         T, V_local = logit_local.shape
+        tp_size = dist.get_world_size(group=tp_group)
 
-        # ── Phase 1: distributed log-sum-exp ─────────────────────────────
+        # ── TP=1 fast path: no cross-rank reductions, single softmax per chunk ──
+        if tp_size == 1:
+            sm_minus_q = logit_local.new_empty(T, V_local)
+            kl = logit_local.new_zeros(T)
+            for t0 in range(0, T, chunk_t):
+                t1 = min(t0 + chunk_t, T)
+                lc = logit_local[t0:t1]  # view [c, V]
+                qc = q_local[t0:t1]
+                log_p = F.log_softmax(lc, dim=-1)  # [c, V]
+                kl[t0:t1] = (qc * (qc.clamp(min=1e-10).log() - log_p)).sum(-1)
+                sm_minus_q[t0:t1] = log_p.exp() - qc
+                del lc, qc, log_p
+            ctx.save_for_backward(sm_minus_q)
+            ctx.tp_group = tp_group
+            return kl
+
+        # ── TP > 1: chunked distributed log-sum-exp + KL ──
+        # Phase 1: distributed log-sum-exp
         lse = logit_local.new_empty(T)  # [T]
         for t0 in range(0, T, chunk_t):
             t1 = min(t0 + chunk_t, T)
@@ -373,7 +411,7 @@ class _VocabParallelKLDiv(torch.autograd.Function):
             lse[t0:t1] = (gmax + gsum.log()).squeeze(-1)
             del gmax, gsum
 
-        # ── Phase 2: KL + (softmax - q) buffer ───────────────────────────
+        # Phase 2: KL + (softmax - q) buffer
         sm_minus_q = logit_local.new_empty(T, V_local)  # [T, V_local]
         kl_local = logit_local.new_zeros(T)  # [T]
         for t0 in range(0, T, chunk_t):
@@ -421,15 +459,16 @@ def distillation_loss(
     """Compute OPSD KL loss over the batch (metho.md §4, §6-9).
 
     Student logits stay vocab-parallel [T, V_local] throughout; no full-vocab
-    gather is ever performed on the GPU.  teacher_forward all-gathers its own
-    logits to CPU-resident [T, V_full] tensors for correct downstream gathers.
+    gather is ever performed on the student side.  teacher_forward returns
+    full-vocab [T, V] GPU tensors for the N selected traces; with N=4 and
+    V≈152k this peaks at ≈4.8 GB per sample alongside the model.
 
     §4 Conf(τ_k) is computed by compute_trace_confs via a dedicated forward over
-    chat(x) + τ_k — separate from the q_k^t forward, per metho.md §4.
+    chat(x) + τ_k — separate from the q_k^t forward, per metho.md §4. Results
+    are cached per rollout group (same x, same τ set across samples).
 
-    §8 q_mix is built per-TP-shard: teacher softmax is computed on CPU over
-    the full vocab, and only the local shard [shard_start:shard_start+V_local]
-    is uploaded to GPU.  Peak GPU delta ≈ [chunk, V_local] ≈ 38 MB (TP=4).
+    §8 q_mix is built per-TP-shard: teacher softmax is computed on GPU over the
+    full vocab and only the local shard accumulates into q_mix_local.
 
     §9 KL is computed by _VocabParallelKLDiv, a custom autograd Function whose
     backward gradient d(KL)/d(logit_local) = softmax_local - q_local uses only
@@ -497,10 +536,10 @@ def distillation_loss(
             q_in_sel = [q_in_sub[k] for k in sel]
             sel_logits = teacher_forward(model, q_in_sel, resp_len)
         else:
-            logits_cpu = teacher_forward(model, q_in_sub, resp_len)
-            sel = select_diverse(args, scores, tokens_i, logits_cpu, device)
-            sel_logits = [logits_cpu[k] for k in sel]  # N CPU tensors [T, V_full]
-            del logits_cpu
+            all_logits = teacher_forward(model, q_in_sub, resp_len)
+            sel = select_diverse(args, scores, tokens_i, all_logits, device)
+            sel_logits = [all_logits[k] for k in sel]  # N GPU tensors [T, V_full]
+            del all_logits
 
         # §7 — mixture weights using this TP rank's local top-K student tokens.
         # weight_idx is in [0, V_local); teacher logits are fetched from the
@@ -509,32 +548,29 @@ def distillation_loss(
         _, weight_idx = torch.topk(p_student / args.opsd_temperature, k=top_k, dim=-1)  # [T, K]
         gathered_list: list[torch.Tensor] = []
         for ltsr in sel_logits:
-            # ltsr is [T, V_full] on CPU; move only the local shard to GPU.
-            l_shard = ltsr[:, shard_start : shard_start + V_local].to(device)  # [T, V_local]
+            # ltsr is [T, V_full] on GPU; take the local shard for this TP rank.
+            l_shard = ltsr[:, shard_start : shard_start + V_local]  # [T, V_local]
             gathered_list.append(l_shard.gather(-1, weight_idx))  # [T, K]
-            del l_shard
         q_gathered = torch.stack(gathered_list, dim=0)  # [N, T, K]
         del gathered_list
         w = mixture_weights(args, p_student, q_gathered, weight_idx)  # [N, T]
         del q_gathered, weight_idx
 
         # §8 — q_mix for this TP rank's vocab shard [T, V_local].
-        # Teacher softmax must be computed over the full vocab so probabilities
-        # are normalised correctly; only the local shard contributes to q_mix.
-        # Upload the chunk to GPU, softmax on GPU (much faster than CPU on
-        # V≈152k), slice to local shard, accumulate. Peak GPU delta per chunk
-        # ≈ [chunk, V_full] float32 ≈ 150 MB at chunk=256, V=152k.
+        # Teacher softmax is computed over the full vocab on GPU (probabilities
+        # need to be normalised against the full vocab); only the local shard
+        # contributes to q_mix.  Chunked along the time axis to bound the
+        # softmax workspace.
         q_mix_local = torch.zeros(T, V_local, dtype=torch.float32, device=device)
-        for k, l_cpu in enumerate(sel_logits):
+        for k, l_gpu in enumerate(sel_logits):
             w_k = w[k]  # [T]
             for t0 in range(0, T, _CHUNK_T):
                 t1 = min(t0 + _CHUNK_T, T)
-                l_chunk_gpu = l_cpu[t0:t1].to(device, non_blocking=True)  # [chunk, V_full] GPU
-                s_full = F.softmax(l_chunk_gpu, dim=-1)  # GPU softmax
+                s_full = F.softmax(l_gpu[t0:t1], dim=-1)  # [chunk, V_full] GPU
                 s_local = s_full[:, shard_start : shard_start + V_local]  # [chunk, V_local]
                 s_local = s_local * w_k[t0:t1].unsqueeze(-1)
                 q_mix_local[t0:t1].add_(s_local)
-                del l_chunk_gpu, s_full, s_local
+                del s_full, s_local
         del sel_logits, w
 
         # §9 — KL(q_mix ‖ p_θ) via vocab-parallel custom autograd.
