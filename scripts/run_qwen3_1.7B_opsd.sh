@@ -126,7 +126,7 @@ EVAL_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.4
+   --sglang-mem-fraction-static 0.35
 )
 
 MISC_ARGS=(
