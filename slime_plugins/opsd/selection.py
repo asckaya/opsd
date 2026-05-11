@@ -24,7 +24,6 @@ def kcenter(scores: list[float], distances: np.ndarray, n_select: int) -> list[i
     """
     selected = [int(np.argmax(scores))]
     selected_set = {selected[0]}
-    n = len(scores)
 
     # min_dist[i] = distance from i to its nearest selected center
     min_dist = distances[selected[0]].copy()
@@ -90,28 +89,24 @@ def _seq_jsd(logits_i: torch.Tensor, logits_j: torch.Tensor, top_k: int) -> floa
     tv_i, ti_i = logits_i.topk(k, dim=-1)  # [T, K]
     tv_j, ti_j = logits_j.topk(k, dim=-1)
 
-    lp_i = F.log_softmax(tv_i, dim=-1)     # [T, K]
+    lp_i = F.log_softmax(tv_i, dim=-1)  # [T, K]
     lp_j = F.log_softmax(tv_j, dim=-1)
     pi, pj = lp_i.exp(), lp_j.exp()
 
     # Cross-evaluate: p_i over top-k(j) and vice-versa
-    lv_j_at_i = F.log_softmax(logits_j.gather(-1, ti_i), dim=-1)   # [T, K]
-    lv_i_at_j = F.log_softmax(logits_i.gather(-1, ti_j), dim=-1)   # [T, K]
+    lv_j_at_i = F.log_softmax(logits_j.gather(-1, ti_i), dim=-1)  # [T, K]
+    lv_i_at_j = F.log_softmax(logits_i.gather(-1, ti_j), dim=-1)  # [T, K]
     pj_at_i, pi_at_j = lv_j_at_i.exp(), lv_i_at_j.exp()
 
     # JSD over top-k(i): p_i vs p_j_at_i
     mix_i = 0.5 * (pi + pj_at_i)
     log_mix_i = mix_i.clamp(min=1e-10).log()
-    jsd_i = 0.5 * (
-        (pi * (lp_i - log_mix_i)).sum(-1) + (pj_at_i * (lv_j_at_i - log_mix_i)).sum(-1)
-    )
+    jsd_i = 0.5 * ((pi * (lp_i - log_mix_i)).sum(-1) + (pj_at_i * (lv_j_at_i - log_mix_i)).sum(-1))
 
     # JSD over top-k(j): p_j vs p_i_at_j
     mix_j = 0.5 * (pj + pi_at_j)
     log_mix_j = mix_j.clamp(min=1e-10).log()
-    jsd_j = 0.5 * (
-        (pj * (lp_j - log_mix_j)).sum(-1) + (pi_at_j * (lv_i_at_j - log_mix_j)).sum(-1)
-    )
+    jsd_j = 0.5 * ((pj * (lp_j - log_mix_j)).sum(-1) + (pi_at_j * (lv_i_at_j - log_mix_j)).sum(-1))
 
     return float((0.5 * (jsd_i + jsd_j)).clamp(min=0).mean().item())
 

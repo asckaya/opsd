@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from slime.backends.megatron_utils.loss import get_responses
@@ -105,10 +106,7 @@ def teacher_forward(
         logits_cpu: per-trace [T, V] float32 tensors on CPU.
         confs:      per-trace mean token log-prob at resp_tokens positions.
     """
-    from megatron.core.parallel_state import (
-        get_tensor_model_parallel_group,
-        get_tensor_model_parallel_world_size,
-    )
+    from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_model_parallel_world_size
 
     tp_size = get_tensor_model_parallel_world_size()
 
@@ -273,6 +271,82 @@ def _pairwise_jsd(q_prob: torch.Tensor, q_log: torch.Tensor) -> torch.Tensor:
     return jsd.sum(dim=1) / (N - 1)  # [N, T]
 
 
+# ── vocab-parallel KL divergence (§9) ───────────────────────────────────────
+
+
+class _VocabParallelKLDiv(torch.autograd.Function):
+    """Forward-KL(q_mix ‖ p_θ) for vocab-parallel student logits.
+
+    Each TP rank holds [T, V_local].  A two-phase chunked algorithm avoids
+    ever materialising [T, V_full] on any GPU:
+
+    Phase 1 — distributed log-sum-exp:
+      Per chunk of token positions, each rank computes its local max and
+      exp-sum, all-reduces both, and writes the global lse into a [T]
+      buffer.  Peak extra GPU memory = [chunk, V_local] ≈ 38 MB (TP=4).
+
+    Phase 2 — KL contribution + backward buffer:
+      Per chunk, log_softmax = logit_local - lse; KL local term is summed
+      and the difference (softmax_local - q_local) is stored in a pre-
+      allocated [T, V_local] buffer for the backward.  One all-reduce of
+      [T] (tiny) gives the global KL at the end.
+
+    Backward: d(KL)/d(logit_local) = softmax_local - q_local.
+      Saved tensor is [T, V_local] ≈ 360 MB (TP=4), not [T, V_full].
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        logit_local: torch.Tensor,  # [T, V_local], requires_grad
+        q_local: torch.Tensor,  # [T, V_local], detached q_mix shard
+        tp_group,
+        chunk_t: int,
+    ) -> torch.Tensor:  # [T]
+        T, V_local = logit_local.shape
+
+        # ── Phase 1: distributed log-sum-exp ─────────────────────────────
+        lse = logit_local.new_empty(T)  # [T]
+        for t0 in range(0, T, chunk_t):
+            t1 = min(t0 + chunk_t, T)
+            c = logit_local[t0:t1]  # view [c, V_local]
+            gmax = c.max(dim=-1, keepdim=True).values  # [c, 1] new tensor
+            dist.all_reduce(gmax, op=dist.ReduceOp.MAX, group=tp_group)
+            gsum = (c - gmax).exp().sum(dim=-1, keepdim=True)  # [c, 1]
+            dist.all_reduce(gsum, op=dist.ReduceOp.SUM, group=tp_group)
+            lse[t0:t1] = (gmax + gsum.log()).squeeze(-1)
+            del gmax, gsum
+
+        # ── Phase 2: KL + (softmax - q) buffer ───────────────────────────
+        sm_minus_q = logit_local.new_empty(T, V_local)  # [T, V_local]
+        kl_local = logit_local.new_zeros(T)  # [T]
+        for t0 in range(0, T, chunk_t):
+            t1 = min(t0 + chunk_t, T)
+            lc = logit_local[t0:t1]  # view [c, V_local]
+            qc = q_local[t0:t1]  # view [c, V_local]
+            log_p = lc - lse[t0:t1].unsqueeze(-1)  # log-softmax [c, V_local]
+            sm_c = log_p.exp()  # softmax [c, V_local]
+            kl_local[t0:t1] = (qc * (qc.clamp(min=1e-10).log() - log_p)).sum(-1)
+            sm_minus_q[t0:t1] = sm_c - qc
+            del log_p, sm_c
+        del lse
+
+        # Single all-reduce to sum KL shards across TP ranks
+        kl = kl_local.clone()
+        dist.all_reduce(kl, op=dist.ReduceOp.SUM, group=tp_group)
+
+        ctx.save_for_backward(sm_minus_q)
+        ctx.tp_group = tp_group
+        return kl
+
+    @staticmethod
+    def backward(ctx, grad_kl: torch.Tensor):
+        (sm_minus_q,) = ctx.saved_tensors
+        # d(KL)/d(logit_local) = softmax_local - q_local
+        grad = grad_kl.unsqueeze(-1) * sm_minus_q  # [T, V_local]
+        return grad, None, None, None
+
+
 # ── KL distillation loss (§8-9) ───────────────────────────────────────────────
 
 
@@ -288,11 +362,24 @@ def distillation_loss(
 ) -> torch.Tensor:
     """Compute OPSD KL loss over the batch (metho.md §6-9).
 
-    Teacher logits are never assembled as [N, T, V] on GPU.  Each trace is
-    processed one at a time; [T, V] tensors are kept on CPU and loaded in
-    _CHUNK_T-row slices for q_mix and KL so peak GPU delta ≈ q_mix + 2×chunk.
+    Student logits stay vocab-parallel [T, V_local] throughout; no full-vocab
+    gather is ever performed on the GPU.  teacher_forward all-gathers its own
+    logits to CPU-resident [T, V_full] tensors for correct conf computation.
+
+    §8 q_mix is built per-TP-shard: teacher softmax is computed on CPU over
+    the full vocab, and only the local shard [shard_start:shard_start+V_local]
+    is uploaded to GPU.  Peak GPU delta ≈ [chunk, V_local] ≈ 38 MB (TP=4).
+
+    §9 KL is computed by _VocabParallelKLDiv, a custom autograd Function whose
+    backward gradient d(KL)/d(logit_local) = softmax_local - q_local uses only
+    the [T, V_local] saved buffer, not [T, V_full].
     """
-    _CHUNK_T = 256  # token-position chunk; each slice ≈ 147 MB for Qwen3-1.7B
+    from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_model_parallel_rank
+
+    _CHUNK_T = 256
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_group = get_tensor_model_parallel_group()
+
     device = student_logits[0].device
     total_kl = torch.tensor(0.0, device=device)
     valid = 0
@@ -303,11 +390,14 @@ def distillation_loss(
             continue
 
         resp_len = int(batch["response_lengths"][i])
-        p_student = student_logits[i]  # [T, V]
+        p_student = student_logits[i]  # [T, V_local] vocab-parallel
         resp_tokens = batch["unconcat_tokens"][i][-resp_len:]  # [T]
-        T, V = p_student.shape
+        T, V_local = p_student.shape
+        shard_start = tp_rank * V_local  # global vocab offset for this TP rank
 
-        # §6 — teacher forward: one trace at a time, returns CPU tensors + confs
+        # §6 — teacher forward: one trace at a time.
+        # teacher_forward all-gathers vocab-parallel logits to full-vocab [T, V_full]
+        # on CPU so that resp_t indexing is in-bounds and conf is correct.
         logits_cpu, confs = teacher_forward(model, teacher_inputs[offset : offset + n], resp_len, resp_tokens)
         offset += n
 
@@ -317,50 +407,46 @@ def distillation_loss(
 
         # §5 — k-center greedy diversity selection (moves pairs to GPU)
         sel = select_diverse(args, scores, tokens_i, logits_cpu, device)
-        sel_logits = [logits_cpu[k] for k in sel]  # N CPU tensors [T, V]
+        sel_logits = [logits_cpu[k] for k in sel]  # N CPU tensors [T, V_full]
         del logits_cpu
 
-        N_sel = len(sel_logits)
-
-        # §7 — mixture weights over student's top-K gathered teacher logits [N, T, K]
-        top_k = min(args.opsd_weight_top_k, V)
+        # §7 — mixture weights using this TP rank's local top-K student tokens.
+        # weight_idx is in [0, V_local); teacher logits are fetched from the
+        # matching vocab shard so all shapes are consistent.
+        top_k = min(args.opsd_weight_top_k, V_local)
         _, weight_idx = torch.topk(p_student / args.opsd_temperature, k=top_k, dim=-1)  # [T, K]
         gathered_list: list[torch.Tensor] = []
-        for l in sel_logits:
-            l_dev = l.to(device)
-            gathered_list.append(l_dev.gather(-1, weight_idx))  # [T, K]
-            del l_dev
+        for ltsr in sel_logits:
+            # ltsr is [T, V_full] on CPU; move only the local shard to GPU.
+            l_shard = ltsr[:, shard_start : shard_start + V_local].to(device)  # [T, V_local]
+            gathered_list.append(l_shard.gather(-1, weight_idx))  # [T, K]
+            del l_shard
         q_gathered = torch.stack(gathered_list, dim=0)  # [N, T, K]
         del gathered_list
         w = mixture_weights(args, p_student, q_gathered, weight_idx)  # [N, T]
         del q_gathered, weight_idx
 
-        # §8 — q_mix = Σ_k w_k * softmax(q_k); chunked over T, peak ≈ q_mix + 2×[chunk,V]
-        q_mix = torch.zeros(T, V, dtype=torch.float32, device=device)
+        # §8 — q_mix for this TP rank's vocab shard [T, V_local].
+        # Teacher softmax must be computed over the full vocab so probabilities
+        # are normalised correctly; only the local shard is then moved to GPU.
+        # Peak GPU delta per chunk ≈ [chunk, V_local] ≈ 38 MB (TP=4).
+        q_mix_local = torch.zeros(T, V_local, dtype=torch.float32, device=device)
         for k, l_cpu in enumerate(sel_logits):
             w_k = w[k]  # [T]
             for t0 in range(0, T, _CHUNK_T):
                 t1 = min(t0 + _CHUNK_T, T)
-                l_c = l_cpu[t0:t1].to(device)  # [chunk, V]
-                s_c = F.softmax(l_c, dim=-1)  # [chunk, V]
-                del l_c
-                s_c.mul_(w_k[t0:t1].unsqueeze(-1))  # in-place weight
-                q_mix[t0:t1].add_(s_c)  # in-place accumulate
-                del s_c
+                l_chunk = l_cpu[t0:t1]  # [chunk, V_full] CPU
+                s_full = F.softmax(l_chunk, dim=-1)  # [chunk, V_full] CPU
+                s_local = s_full[:, shard_start : shard_start + V_local].to(device)  # [chunk, V_local]
+                s_local.mul_(w_k[t0:t1].unsqueeze(-1))
+                q_mix_local[t0:t1].add_(s_local)
+                del l_chunk, s_full, s_local
         del sel_logits, w
 
-        # §9 — KL(q_mix ‖ p_θ); chunked over T, peak ≈ q_mix + 2×[chunk,V]
-        kl = torch.zeros(T, device=device)
-        for t0 in range(0, T, _CHUNK_T):
-            t1 = min(t0 + _CHUNK_T, T)
-            qc = q_mix[t0:t1]  # view [chunk, V]
-            log_q = qc.clamp(min=1e-10).log()  # [chunk, V]
-            log_p = F.log_softmax(p_student[t0:t1], dim=-1)  # [chunk, V]
-            log_q.sub_(log_p)  # in-place: log_q -= log_p
-            del log_p
-            kl[t0:t1] = (qc * log_q).sum(-1)
-            del log_q
-        del q_mix
+        # §9 — KL(q_mix ‖ p_θ) via vocab-parallel custom autograd.
+        # Backward memory = [T, V_local] saved buffer ≈ 360 MB (TP=4).
+        kl = _VocabParallelKLDiv.apply(p_student, q_mix_local.detach(), tp_group, _CHUNK_T)
+        del q_mix_local
 
         if args.opsd_jsd_token_clip is not None:
             kl = kl.clamp(max=args.opsd_jsd_token_clip)
@@ -382,16 +468,8 @@ def distillation_loss(
 
 
 def extract_student_responses(logits: torch.Tensor, args, batch: dict) -> list[torch.Tensor]:
-    from megatron.core import mpu, tensor_parallel
-
-    # Megatron returns vocab-parallel logits [1, T, V/tp] when TP > 1.
-    # Gather to full-vocab [1, T, V] so topk, softmax and KL operate over
-    # the complete distribution.  The backward of gather_from_tensor_model_
-    # parallel_region is a reduce-scatter that correctly distributes the KL
-    # gradient back to each TP rank's shard.
-    if mpu.get_tensor_model_parallel_world_size() > 1:
-        logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
-
+    # Student logits stay vocab-parallel [T, V_local]; distillation_loss and
+    # _VocabParallelKLDiv are designed to operate on them without gathering.
     return [
         chunk
         for chunk, _ in get_responses(

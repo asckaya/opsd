@@ -35,9 +35,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
     def generate_rollout(self, args, rollout_id, data_source, evaluation=False):
         if self._tokenizer is None:
             self._tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
-        return rollout_module.generate_rollout(
-            args, rollout_id, data_source, self._tokenizer, evaluation=evaluation
-        )
+        return rollout_module.generate_rollout(args, rollout_id, data_source, self._tokenizer, evaluation=evaluation)
 
     # ── loss ──────────────────────────────────────────────────────────────────
 
@@ -60,7 +58,13 @@ class OPSDPlugin(metaclass=SingletonMeta):
             return base_loss, metrics
 
         opsd_kl = distillation_loss(
-            args, batch, student_logits, teacher_inputs, counts, cand_scores, cand_tokens,
+            args,
+            batch,
+            student_logits,
+            teacher_inputs,
+            counts,
+            cand_scores,
+            cand_tokens,
             self._model,
         )
         total_loss = base_loss + args.opsd_alpha * opsd_kl
