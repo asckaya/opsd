@@ -82,11 +82,7 @@ def build_teacher_inputs(
 
 def _build_privileged_prompt(problem: str, trace_tokens: list[int], tokenizer) -> str:
     reference = tokenizer.decode(trace_tokens, skip_special_tokens=True)
-    return (
-        f"Problem: {problem}\n\n"
-        f"Here is a reference solution:\n=== Begin ===\n{reference}\n=== End ==="
-        f"{_TRANSITION_PROMPT}{_BOXED_INSTRUCTION}"
-    )
+    return f"Problem: {problem}\n\nHere is a reference solution:\n=== Begin ===\n{reference}\n=== End ==={_TRANSITION_PROMPT}{_BOXED_INSTRUCTION}"
 
 
 # ── teacher forward (§6) ─────────────────────────────────────────────────────
@@ -109,7 +105,11 @@ def teacher_forward(
         logits_cpu: per-trace [T, V] float32 tensors on CPU.
         confs:      per-trace mean token log-prob at resp_tokens positions.
     """
-    from megatron.core.parallel_state import get_tensor_model_parallel_world_size
+    from megatron.core.parallel_state import (
+        get_tensor_model_parallel_group,
+        get_tensor_model_parallel_world_size,
+    )
+
     tp_size = get_tensor_model_parallel_world_size()
 
     device = inputs[0].device
@@ -129,10 +129,19 @@ def teacher_forward(
         del inp_model
         raw = out[0] if isinstance(out, tuple) else out
         # Slice original (non-padded) response positions; padding is at the tail.
-        logit_t = raw[0, orig_len - resp_len : orig_len].float()  # [T, V]
+        # With TP > 1 the model returns vocab-parallel logits [T, V/tp]; all-gather
+        # to full vocab [T, V] so that resp_t indices (range 0..V-1) are in-bounds
+        # and logsumexp covers the full distribution.
+        logit_t = raw[0, orig_len - resp_len : orig_len].float()  # [T, V_local]
         del out, raw
 
-        lse = torch.logsumexp(logit_t, dim=-1)                          # [T]
+        if tp_size > 1:
+            tp_group = get_tensor_model_parallel_group()
+            shards = [torch.empty_like(logit_t) for _ in range(tp_size)]
+            torch.distributed.all_gather(shards, logit_t.contiguous(), group=tp_group)
+            logit_t = torch.cat(shards, dim=-1)  # [T, V_full]
+
+        lse = torch.logsumexp(logit_t, dim=-1)  # [T]
         at_resp = logit_t[torch.arange(resp_len, device=device), resp_t]  # [T]
         confs.append((at_resp - lse).mean().item())
         del lse, at_resp
@@ -229,18 +238,14 @@ def mixture_weights(
     N, T, K = q_gathered.shape
 
     p_log = F.log_softmax(p_student.gather(-1, weight_idx) / args.opsd_temperature, dim=-1)  # [T, K]
-    q_log = F.log_softmax(q_gathered / args.opsd_temperature, dim=-1)                         # [N, T, K]
+    q_log = F.log_softmax(q_gathered / args.opsd_temperature, dim=-1)  # [N, T, K]
     q_prob = q_log.exp()
 
-    delta = (q_prob * (q_log - p_log.unsqueeze(0))).sum(-1).clamp(min=0)   # [N, T]
-    entropy = -(q_prob * q_log).sum(-1)                                      # [N, T]
+    delta = (q_prob * (q_log - p_log.unsqueeze(0))).sum(-1).clamp(min=0)  # [N, T]
+    entropy = -(q_prob * q_log).sum(-1)  # [N, T]
     diversity = _pairwise_jsd(q_prob, q_log) if N > 1 else torch.zeros(N, T, device=p_student.device)
 
-    logits = (
-        -args.opsd_kl_weight * delta
-        - args.opsd_entropy_weight * entropy
-        + args.opsd_diversity_weight * diversity
-    )
+    logits = -args.opsd_kl_weight * delta - args.opsd_entropy_weight * entropy + args.opsd_diversity_weight * diversity
     return F.softmax(logits, dim=0)  # [N, T]
 
 
@@ -254,16 +259,14 @@ def _pairwise_jsd(q_prob: torch.Tensor, q_log: torch.Tensor) -> torch.Tensor:
         [N, T]
     """
     N = q_prob.size(0)
-    pi  = q_prob.unsqueeze(1)   # [N, 1, T, K]
-    pj  = q_prob.unsqueeze(0)   # [1, N, T, K]
+    pi = q_prob.unsqueeze(1)  # [N, 1, T, K]
+    pj = q_prob.unsqueeze(0)  # [1, N, T, K]
     lpi = q_log.unsqueeze(1)
     lpj = q_log.unsqueeze(0)
 
     mix = 0.5 * (pi + pj)
     log_mix = mix.clamp(min=1e-10).log()
-    jsd = 0.5 * (
-        (pi * (lpi - log_mix)).sum(-1) + (pj * (lpj - log_mix)).sum(-1)
-    ).clamp(min=0)  # [N, N, T]
+    jsd = 0.5 * ((pi * (lpi - log_mix)).sum(-1) + (pj * (lpj - log_mix)).sum(-1)).clamp(min=0)  # [N, N, T]
 
     eye = torch.eye(N, dtype=torch.bool, device=q_prob.device)
     jsd = jsd.masked_fill(eye.unsqueeze(-1), 0.0)
@@ -300,14 +303,12 @@ def distillation_loss(
             continue
 
         resp_len = int(batch["response_lengths"][i])
-        p_student = student_logits[i]                           # [T, V]
-        resp_tokens = batch["unconcat_tokens"][i][-resp_len:]   # [T]
+        p_student = student_logits[i]  # [T, V]
+        resp_tokens = batch["unconcat_tokens"][i][-resp_len:]  # [T]
         T, V = p_student.shape
 
         # §6 — teacher forward: one trace at a time, returns CPU tensors + confs
-        logits_cpu, confs = teacher_forward(
-            model, teacher_inputs[offset : offset + n], resp_len, resp_tokens
-        )
+        logits_cpu, confs = teacher_forward(model, teacher_inputs[offset : offset + n], resp_len, resp_tokens)
         offset += n
 
         # §4 — full quality score + TopK_b
@@ -329,7 +330,7 @@ def distillation_loss(
             l_dev = l.to(device)
             gathered_list.append(l_dev.gather(-1, weight_idx))  # [T, K]
             del l_dev
-        q_gathered = torch.stack(gathered_list, dim=0)           # [N, T, K]
+        q_gathered = torch.stack(gathered_list, dim=0)  # [N, T, K]
         del gathered_list
         w = mixture_weights(args, p_student, q_gathered, weight_idx)  # [N, T]
         del q_gathered, weight_idx
@@ -340,11 +341,11 @@ def distillation_loss(
             w_k = w[k]  # [T]
             for t0 in range(0, T, _CHUNK_T):
                 t1 = min(t0 + _CHUNK_T, T)
-                l_c = l_cpu[t0:t1].to(device)          # [chunk, V]
-                s_c = F.softmax(l_c, dim=-1)            # [chunk, V]
+                l_c = l_cpu[t0:t1].to(device)  # [chunk, V]
+                s_c = F.softmax(l_c, dim=-1)  # [chunk, V]
                 del l_c
-                s_c.mul_(w_k[t0:t1].unsqueeze(-1))     # in-place weight
-                q_mix[t0:t1].add_(s_c)                  # in-place accumulate
+                s_c.mul_(w_k[t0:t1].unsqueeze(-1))  # in-place weight
+                q_mix[t0:t1].add_(s_c)  # in-place accumulate
                 del s_c
         del sel_logits, w
 
@@ -352,10 +353,10 @@ def distillation_loss(
         kl = torch.zeros(T, device=device)
         for t0 in range(0, T, _CHUNK_T):
             t1 = min(t0 + _CHUNK_T, T)
-            qc = q_mix[t0:t1]                               # view [chunk, V]
-            log_q = qc.clamp(min=1e-10).log()               # [chunk, V]
-            log_p = F.log_softmax(p_student[t0:t1], dim=-1) # [chunk, V]
-            log_q.sub_(log_p)                               # in-place: log_q -= log_p
+            qc = q_mix[t0:t1]  # view [chunk, V]
+            log_q = qc.clamp(min=1e-10).log()  # [chunk, V]
+            log_p = F.log_softmax(p_student[t0:t1], dim=-1)  # [chunk, V]
+            log_q.sub_(log_p)  # in-place: log_q -= log_p
             del log_p
             kl[t0:t1] = (qc * log_q).sum(-1)
             del log_q
@@ -381,6 +382,16 @@ def distillation_loss(
 
 
 def extract_student_responses(logits: torch.Tensor, args, batch: dict) -> list[torch.Tensor]:
+    from megatron.core import mpu, tensor_parallel
+
+    # Megatron returns vocab-parallel logits [1, T, V/tp] when TP > 1.
+    # Gather to full-vocab [1, T, V] so topk, softmax and KL operate over
+    # the complete distribution.  The backward of gather_from_tensor_model_
+    # parallel_region is a reduce-scatter that correctly distributes the KL
+    # gradient back to each TP rank's shard.
+    if mpu.get_tensor_model_parallel_world_size() > 1:
+        logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
+
     return [
         chunk
         for chunk, _ in get_responses(
