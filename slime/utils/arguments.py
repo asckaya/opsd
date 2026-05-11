@@ -1393,25 +1393,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=128,
                 help="Top-K vocab truncation for token-level JSD diversity",
             )
-            parser.add_argument(
-                "--opsd-teacher-mode",
-                type=str,
-                choices=["ema", "frozen"],
-                default="frozen",
-                help="Teacher mode: EMA-updated or frozen initial weights",
-            )
-            parser.add_argument(
-                "--opsd-ema-decay",
-                type=float,
-                default=0.999,
-                help="EMA decay for OPSD teacher when opsd-teacher-mode=ema",
-            )
-            parser.add_argument(
-                "--opsd-teacher-chunk-size",
-                type=int,
-                default=8,
-                help="Chunk size for OPSD teacher forward pass (0 disables chunking)",
-            )
             return parser
 
         def add_mtp_training_arguments(parser):

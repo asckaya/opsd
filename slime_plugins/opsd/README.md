@@ -1,64 +1,59 @@
-# Diverse Self-Privileged OPSD Plugin for slime
+# OPSD Plugin for slime
 
-This plugin implements the **Diverse Self-Privileged OPSD** algorithm, which leverages a student model's own successful reasoning traces as privileged information for on-policy self-distillation.
+On-policy self-distillation (OPD): the student's own successful reasoning traces
+serve as privileged information for token-level mixture-teacher distillation.
+No separate teacher model — the training model itself is used for teacher inference.
 
-## Features
+## Algorithm
 
-- **On-policy sampling**: Generates $K$ samples per prompt.
-- **Diversity selection**: Selects $N$ diverse correct traces using k-center greedy (Unigram JSD).
-- **Mixture Teacher**: Constructs a token-level mixture teacher from privileged traces.
-- **Adaptive Weighting**: Computes per-token mixture weights based on KL, Entropy, and Diversity.
-- **Megatron Integration**: Plugs into slime's Megatron backend via custom hooks and loss functions.
+1. **Rollout**: Sample K trajectories per prompt from the current policy.
+2. **Filter**: Keep correct traces `B_x = {τ | R(x, τ) = 1}`.
+3. **Quality score**: `s(τ) = 1 - η_l·len/L - η_f·format + η_c·conf`.
+4. **TopK_b**: Retain top-K_b candidates by full quality score.
+5. **Diversity**: Select N traces `P_x` via k-center greedy (unigram-JSD or token-JSD).
+6. **Teacher**: `q_k^t = π_θ(·| x, τ_k, y_{<t})` — same weights, privileged context.
+7. **Weights**: `w_k^t ∝ exp(-β·Δ_k^t - γ·h_k^t + ρ·g_k^t)`.
+8. **Distill**: `L = KL(Σ_k w_k^t q_k^t ‖ p_θ^t)`.
 
-## Components
+## Files
 
-- `plugin.py`: Rollout selection, hook wiring, and mixture-teacher loss.
-- `teacher.py`: Lazy training-teacher loading and optional EMA updates.
+| File | Responsibility |
+|---|---|
+| `__init__.py` | Thin slime entry-point wrappers |
+| `plugin.py` | `OPSDPlugin` singleton — hook wiring and loss orchestration |
+| `rollout.py` | Rollout phase: K-sample generation, correct-trace filtering, metadata attachment |
+| `distillation.py` | Training phase: teacher forward, quality scoring, diversity selection, KL loss |
+| `selection.py` | k-center greedy + pairwise JSD distance utilities |
 
 ## Usage
 
-To use this plugin, you can refer to the example script: `scripts/run_qwen3_1.7B_opsd.sh`.
-
-Key arguments:
+See `scripts/run_qwen3_1.7B_opsd.sh` for a complete example.
 
 ```bash
-# Rollout
 --rollout-function-path slime_plugins.opsd.generate_rollout
-
-# Hooks
 --custom-megatron-init-path slime_plugins.opsd.init_hook
 --custom-megatron-before-train-step-hook-path slime_plugins.opsd.before_train_step_hook
-
-# Loss
 --loss-type custom_loss
 --custom-loss-function-path slime_plugins.opsd.loss_function
-
-# OPSD Parameters
---opsd-k 16                    # Number of samples to generate (K)
---opsd-n 8                     # Max privileged traces to select (N)
---opsd-kb 16                   # Pre-filter top K_b by quality
---opsd-alpha 1.0               # OPSD loss weight (alpha)
---opsd-kl-weight 1.0           # Mixture weight: KL coefficient (beta)
---opsd-entropy-weight 0.5      # Mixture weight: Entropy coefficient (gamma)
---opsd-diversity-weight 0.5    # Mixture weight: Diversity coefficient (rho)
---opsd-temperature 1.0         # Temperature for mixture weight computation
---opsd-weight-top-k 512        # Vocab truncation for mixture weights
---opsd-jsd-token-clip 10.0     # Clip JSD per token
---opsd-fallback-to-gt          # Use GT traces if no correct self-generated traces
---opsd-quality-len-weight 0.1  # Quality length penalty weight (eta_l)
---opsd-quality-format-weight 0.2 # Quality format penalty weight (eta_f)
---opsd-quality-conf-weight 0.5 # Confidence weight; computed on the training side
---opsd-diversity-metric token_jsd # Diversity distance for k-center selection
---opsd-diversity-top-k 128      # Top-K vocab truncation for token-level JSD
---opsd-teacher-mode ema         # Teacher mode: ema or frozen
---opsd-ema-decay 0.999          # EMA decay when teacher mode is ema
---opsd-teacher-chunk-size 8     # Chunk size for teacher forward (0 disables)
 ```
 
-## Algorithm Summary
+## Hyperparameters
 
-1.  **Sampling**: For each prompt $x$, sample $K$ trajectories $\tau_j \sim \pi_{\theta_{old}}$.
-2.  **Filtering**: Keep correct trajectories $B_x = \{ \tau_j | R(x, \tau_j) = 1 \}$.
-3.  **Selection**: Select $N$ diverse trajectories $P_x = \text{TopK}(B_x, \text{diverse\_k\_center})$.
-4.  **Teacher**: For each $\tau \in P_x$, the teacher is $q_\tau^t = \pi_{\theta_T}(\cdot | x, \tau, y_{<t})$.
-5.  **Distillation**: Minimize $\mathbb{E}_{y \sim \pi_\theta} [ KL(\sum w_\tau^t q_\tau^t || \pi_\theta) ]$.
+| Argument | Default | Description |
+|---|---|---|
+| `--opsd-k` | — | Rollout samples per prompt (K) |
+| `--opsd-n` | — | Diverse traces to select (N) |
+| `--opsd-kb` | — | Pre-filter top-K_b by quality |
+| `--opsd-alpha` | 1.0 | Distillation loss weight |
+| `--opsd-kl-weight` | 1.0 | Mixture weight β (KL term) |
+| `--opsd-entropy-weight` | 0.5 | Mixture weight γ (entropy term) |
+| `--opsd-diversity-weight` | 0.5 | Mixture weight ρ (diversity term) |
+| `--opsd-temperature` | 1.0 | Temperature for weight computation |
+| `--opsd-weight-top-k` | 512 | Vocab truncation for weight computation |
+| `--opsd-jsd-token-clip` | — | Per-token KL clip value |
+| `--opsd-fallback-to-gt` | false | Use GT trace when B_x is empty |
+| `--opsd-quality-len-weight` | 0.1 | η_l: length penalty |
+| `--opsd-quality-format-weight` | 0.2 | η_f: format penalty |
+| `--opsd-quality-conf-weight` | 0.5 | η_c: confidence weight |
+| `--opsd-diversity-metric` | `token_jsd` | `token_jsd` or `unigram_jsd` |
+| `--opsd-diversity-top-k` | 128 | Vocab truncation for token-JSD diversity |

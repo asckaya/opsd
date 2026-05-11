@@ -14,7 +14,7 @@ def init_hook(args):
 
 
 def before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler):
-    """Megatron before-train-step hook entrypoint."""
+    """Megatron before-train-step hook entrypoint (registers the training model)."""
     OPSDPlugin().before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
 

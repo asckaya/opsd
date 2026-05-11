@@ -73,9 +73,6 @@ OPSD_ARGS=(
    --opsd-temperature 1.0     # Temperature for mixture weights
    --opsd-weight-top-k 512    # Efficiency: truncate vocab for weights
    --opsd-diversity-top-k 128 # Top-K vocab truncation for token-level JSD
-   --opsd-teacher-mode ema
-   --opsd-ema-decay 0.999
-   --opsd-teacher-chunk-size 8
 )
 
 # Performance & Parallelism
