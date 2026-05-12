@@ -1481,6 +1481,25 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "regularization toward the initial policy."
                 ),
             )
+            parser.add_argument(
+                "--opsd-student-pick",
+                type=str,
+                choices=["random", "non_privileged"],
+                default="random",
+                help=(
+                    "How to pick the single student-y trace from each group's K rollouts "
+                    "for training (method.md / paper Algorithm 1 line 5: one student "
+                    "rollout per prompt; paper's vLLM call uses `n=1`). The other K-1 "
+                    "traces are kept only as the privileged-candidate pool (for Conf, "
+                    "TopK_b, diversity selection, q_k^t teacher targets). "
+                    "`random`: uniform pick from the K — statistically equivalent to a "
+                    "fresh ŷ ∼ π_θ_old (paper's natural sampling, no bias). "
+                    "`non_privileged`: uniform pick from the K \\ selected-privileged "
+                    "subset — same cost, also avoids the degenerate case where the "
+                    "student y is itself one of the τ_k appearing in the teacher's "
+                    "privileged conditioning context."
+                ),
+            )
             return parser
 
         def add_mtp_training_arguments(parser):
@@ -1812,6 +1831,24 @@ def slime_validate_args(args):
         args.opsd_pointwise_kl_clip = None
     if args.opsd_jsd_token_clip is not None and args.opsd_jsd_token_clip <= 0:
         args.opsd_jsd_token_clip = None
+
+    # OPSD always reduces to 1 student trace per prompt for training
+    # (method.md / paper Algorithm 1 line 5). That means train_batch =
+    # rollout_batch_size, and we need it to fit at least one global_batch_size
+    # to make a gradient step. Three resolutions, all user-facing — surface a
+    # clear error if none of them is in effect:
+    if hasattr(args, "opsd_student_pick"):
+        train_samples = args.rollout_batch_size
+        if not args.use_dynamic_global_batch_size and train_samples < args.global_batch_size:
+            raise ValueError(
+                f"OPSD picks 1 student-y per prompt (--opsd-student-pick={args.opsd_student_pick}), "
+                f"so train_batch == rollout_batch_size = {train_samples}, but "
+                f"--global-batch-size = {args.global_batch_size}. "
+                f"num_steps_per_rollout would floor to 0 and the rollout would be wasted. Fix:\n"
+                f"  (a) raise --rollout-batch-size to {args.global_batch_size} (paper-strict batch, ~2× rollout cost);\n"
+                f"  (b) lower --global-batch-size to {train_samples} or less (deviates from paper Table 6 effective batch 32, may need LR retune);\n"
+                f"  (c) add --use-dynamic-global-batch-size (auto-shrink batch to fit, effective batch ≈ rollout_batch rounded down to dp_size)."
+            )
 
     if args.megatron_to_hf_mode == "bridge":
         if (
