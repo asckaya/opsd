@@ -167,7 +167,15 @@ def teacher_forward(
         inp_model = F.pad(inp, (0, pad_len)) if pad_len else inp
 
         with torch.no_grad():
-            out = model(input_ids=inp_model.unsqueeze(0), position_ids=None, attention_mask=None, labels=None)
+            # fp32_output=False keeps model output in bf16/fp16; upcasting the full
+            # [1, T, V_local] tensor would double peak memory and OOMs on long T.
+            out = model(
+                input_ids=inp_model.unsqueeze(0),
+                position_ids=None,
+                attention_mask=None,
+                labels=None,
+                fp32_output=False,
+            )
         del inp_model
         raw = out[0] if isinstance(out, tuple) else out
         # output[i] predicts input[i+1]; response positions [P, P+T) ← logits [P-1, P+T-1).
@@ -215,7 +223,13 @@ def compute_trace_confs(
         device = inp.device
 
         with torch.no_grad():
-            out = model(input_ids=inp_model.unsqueeze(0), position_ids=None, attention_mask=None, labels=None)
+            out = model(
+                input_ids=inp_model.unsqueeze(0),
+                position_ids=None,
+                attention_mask=None,
+                labels=None,
+                fp32_output=False,
+            )
         del inp_model
         raw = out[0] if isinstance(out, tuple) else out
         logit_t = raw[0, orig_len - trace_len - 1 : orig_len - 1].float()  # [trace_len, V_local]
