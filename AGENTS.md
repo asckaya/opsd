@@ -2,7 +2,7 @@
 
 Source of truth for the OPSD method is:
 
-- `../OPSD/metho.md`
+- `method.md`
 
 Implementation guidelines for this repo:
 

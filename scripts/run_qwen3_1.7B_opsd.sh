@@ -46,10 +46,17 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --rollout-batch-size 16
-   --rollout-max-response-len 2048
-   --rollout-temperature 1.0
-   
-   --global-batch-size 128
+   # Paper Table 6 (OPSD column): MaxCompletionLength=1024, SamplingTemperature=1.1.
+   # Table 8 evaluation params add top_p=0.95, top_k=-1 (slime default); the OPSD
+   # reference scripts also pass top_k=20 to vLLM. We use top_k=20 here to match
+   # the reference; flip to -1 if you want the eval-time setting.
+   --rollout-max-response-len 1024
+   --rollout-temperature 1.1
+   --rollout-top-p 0.95
+   --rollout-top-k 20
+
+   # Paper Table 6: EffectiveBatchSize = 32.
+   --global-batch-size 32
    --n-samples-per-prompt 1  # Base n_samples, OPSD rollout will override this to opsd_k
 )
 
@@ -63,22 +70,21 @@ OPSD_ARGS=(
    --custom-loss-function-path slime_plugins.opsd.loss_function
 
    # OPSD Hyperparameters — tuned for throughput while staying inside
-   # metho.md §13 recommendations (K=8-32, N=2-4, K_b=8-16).
+   # method.md §13 recommendations (K=8-32, N=2-4, K_b=8-16).
    --opsd-k 16                # Sample 16 trajectories (K)
-   --opsd-n 4                 # Select 4 diverse traces (N) — metho.md recommends 2-4
+   --opsd-n 4                 # Select 4 diverse traces (N) — method.md recommends 2-4
    --opsd-kb 8                # Pre-filter top 8 by quality (K_b) — halves q_forwards vs K_b=16
-   --opsd-alpha 1.0           # Distillation loss weight (alpha)
+   --opsd-alpha 1.0           # L_distill weight (method.md §9). No GRPO baggage by default.
    --opsd-kl-weight 1.0       # Mixture weight KL coeff (beta)
    --opsd-entropy-weight 0.5  # Mixture weight Entropy coeff (gamma)
    --opsd-diversity-weight 0.5 # Mixture weight Diversity coeff (rho)
-   --opsd-temperature 1.0     # Temperature for mixture weights
    --opsd-weight-top-k 512    # Efficiency: truncate vocab for weights
-   --opsd-diversity-metric unigram_jsd  # token_jsd is metho.md-recommended but
-                                        # forces q_forward on all K_b candidates.
-                                        # unigram_jsd lets diversity selection
-                                        # happen FIRST and q_forward run only on
-                                        # the N selected traces — halves cost.
+   # --opsd-diversity-metric defaults to token_jsd (method.md §5 "recommended").
+   # If wall-clock matters more than fidelity, pass `--opsd-diversity-metric unigram_jsd`
+   # to do selection BEFORE the q-forward and save (K_b - N) q_forwards per sample.
    --opsd-diversity-top-k 128 # Top-K vocab truncation for token-level JSD
+   # --opsd-pointwise-kl-clip defaults to 0.05 (paper §3.2 / Figure 4 — official
+   # OPSD scripts ship with --jsd_token_clip 0.05; required for >50-step runs).
 )
 
 # Performance & Parallelism
@@ -101,7 +107,8 @@ PERF_ARGS=(
 # Optimizer
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-6
+   # Paper Table 6 (OPSD column): LearningRate = 5e-6.
+   --lr 5e-6
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9

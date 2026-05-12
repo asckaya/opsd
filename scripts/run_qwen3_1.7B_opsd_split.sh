@@ -56,10 +56,15 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --rollout-batch-size 16
-   --rollout-max-response-len 2048
-   --rollout-temperature 1.0
+   # Paper Table 6 (OPSD): MaxCompletionLength=1024, SamplingTemperature=1.1.
+   # +top_p=0.95, top_k=20 from the OPSD reference scripts.
+   --rollout-max-response-len 1024
+   --rollout-temperature 1.1
+   --rollout-top-p 0.95
+   --rollout-top-k 20
 
-   --global-batch-size 128
+   # Paper Table 6: EffectiveBatchSize = 32.
+   --global-batch-size 32
    --n-samples-per-prompt 1  # Base n_samples, OPSD rollout will override this to opsd_k
 )
 
@@ -78,9 +83,9 @@ OPSD_ARGS=(
    --opsd-kl-weight 1.0
    --opsd-entropy-weight 0.5
    --opsd-diversity-weight 0.5
-   --opsd-temperature 1.0
    --opsd-weight-top-k 512
-   --opsd-diversity-metric unigram_jsd  # see run_qwen3_1.7B_opsd.sh for rationale
+   # Method.md §5 recommends token_jsd; the plugin defaults to it. To trade
+   # fidelity for throughput pass `--opsd-diversity-metric unigram_jsd`.
    --opsd-diversity-top-k 128
 )
 
@@ -104,7 +109,8 @@ PERF_ARGS=(
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-6
+   # Paper Table 6 (OPSD): LearningRate = 5e-6.
+   --lr 5e-6
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9

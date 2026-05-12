@@ -135,9 +135,19 @@ class OPSDPlugin(metaclass=SingletonMeta):
     # ── loss ──────────────────────────────────────────────────────────────────
 
     def loss_function(self, args, batch, logits, sum_of_sample_mean):
-        self._args = args
+        """OPSD distillation loss (method.md §9, paper.md Eq 8).
 
-        base_loss, metrics = policy_loss_function(args, batch, logits, sum_of_sample_mean)
+        Default behavior: pure full-vocabulary forward-KL distillation —
+        ``L = α · (1/T) Σ_t KL(q_mix^t ‖ p_θ^t)``, with optional reverse-KL
+        auxiliary (method.md §9, ``α_RKL << 1``).  Reduction goes through
+        slime's ``sum_of_sample_mean`` so it integrates with Megatron grad
+        accumulation the same way ``sft_loss_function`` does.
+
+        Opt-in: ``--opsd-mix-with-policy-loss`` adds the GRPO PG-loss back on
+        top.  Useful only for ablations against the legacy hybrid path; the
+        paper's OPSD does NOT mix with a policy gradient.
+        """
+        self._args = args
 
         assert self._model is not None, "OPSD: model not set — before_train_step_hook not called"
         assert self._tokenizer is not None, "OPSD: tokenizer not set — init_hook not called"
@@ -162,12 +172,39 @@ class OPSDPlugin(metaclass=SingletonMeta):
                 offload_to_cpu=False,
             )
 
-        if not any(o is not None for o in sample_teacher_outputs):
-            return base_loss, metrics
+        # Per-token tensors (one [T_i] per sample).  Samples with no
+        # privileged candidates contribute zeros that still flow grad through
+        # student_logits so autograd graph stays connected on every rank.
+        per_token_kl, per_token_rkl, opsd_metrics = distillation_loss(
+            args, batch, student_logits, sample_teacher_outputs
+        )
 
-        opsd_kl, opsd_metrics = distillation_loss(args, batch, student_logits, sample_teacher_outputs)
+        flat_kl = torch.cat(per_token_kl, dim=0)
+        kl_reduced = sum_of_sample_mean(flat_kl)  # per-sample masked-mean, summed
+        distill_loss = kl_reduced * args.opsd_alpha
 
-        total_loss = base_loss + args.opsd_alpha * opsd_kl
-        metrics.update({"opsd_kl": opsd_kl.detach(), "opsd_total": total_loss.detach()})
+        metrics: dict[str, torch.Tensor] = {"opsd_kl": kl_reduced.detach()}
         metrics.update(opsd_metrics)
+
+        total_loss = distill_loss
+
+        # Optional method.md §9 reverse-KL auxiliary.
+        rkl_weight = getattr(args, "opsd_rkl_weight", 0.0)
+        if rkl_weight > 0 and per_token_rkl is not None:
+            flat_rkl = torch.cat(per_token_rkl, dim=0)
+            rkl_reduced = sum_of_sample_mean(flat_rkl)
+            total_loss = total_loss + rkl_reduced * rkl_weight
+            metrics["opsd_rkl_loss"] = (rkl_reduced * rkl_weight).detach()
+            metrics["opsd_rkl"] = rkl_reduced.detach()
+
+        # Optional legacy hybrid: add GRPO PG-loss on top.  Off by default
+        # because the paper's OPSD is a *replacement* for GRPO, not a side
+        # signal — keeping this around only for ablations.
+        if getattr(args, "opsd_mix_with_policy_loss", False):
+            base_loss, pg_metrics = policy_loss_function(args, batch, logits, sum_of_sample_mean)
+            total_loss = total_loss + base_loss
+            metrics.update(pg_metrics)
+            metrics["opsd_base_loss"] = base_loss.detach()
+
+        metrics["opsd_total"] = total_loss.detach()
         return total_loss, metrics

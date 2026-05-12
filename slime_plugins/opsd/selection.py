@@ -1,7 +1,7 @@
-"""Diversity selection for OPSD (metho.md §5).
+"""Diversity selection for OPSD (method.md §5).
 
 k-center greedy over two distance metrics:
-  - unigram_jsd: fast, token-count based (method 1 in metho.md)
+  - unigram_jsd: fast, token-count based (method 1 in method.md)
   - token_jsd:   distribution-based (method 2, recommended)
 """
 

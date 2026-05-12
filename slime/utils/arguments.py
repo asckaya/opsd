@@ -1333,13 +1333,50 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_opsd_arguments(parser):
-            """Add OPSD specific arguments."""
+            """Add OPSD specific arguments.
+
+            Defaults align with method.md (the project's source-of-truth method
+            spec).  Where method.md is silent, defaults align with paper.md
+            (the published OPSD paper) — in particular the per-(pos,vocab) KL
+            clip τ defaults to 0.05, matching the OPSD reference scripts.
+            """
             parser.add_argument("--opsd-k", type=int, default=8, help="Number of samples to generate (K)")
             parser.add_argument("--opsd-n", type=int, default=2, help="Number of privileged traces to select (N)")
             parser.add_argument(
                 "--opsd-kb", type=int, default=None, help="Number of candidates to keep after quality scoring"
             )
-            parser.add_argument("--opsd-alpha", type=float, default=1.0, help="OPSD loss weight")
+            parser.add_argument(
+                "--opsd-alpha",
+                type=float,
+                default=1.0,
+                help=(
+                    "Scale on the OPSD distillation loss L_distill (method.md §9). "
+                    "With --opsd-mix-with-policy-loss off (default) the *only* loss "
+                    "is α · L_distill, so 1.0 is the method-aligned default."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-rkl-weight",
+                type=float,
+                default=0.0,
+                help=(
+                    "Optional reverse-KL auxiliary weight (method.md §9: "
+                    "L_total = L_distill + α_RKL·L_RKL, α_RKL ≪ 1). 0 disables. "
+                    "When set, an additional vocab-parallel KL(p_θ‖q_mix) is "
+                    "computed and added to the loss."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-mix-with-policy-loss",
+                action="store_true",
+                default=False,
+                help=(
+                    "Add the GRPO policy-gradient loss on top of the OPSD "
+                    "distillation loss. OFF by default — paper.md's OPSD is a "
+                    "replacement for GRPO, not a side signal. Keep this flag "
+                    "for ablations only."
+                ),
+            )
             parser.add_argument(
                 "--opsd-kl-weight", type=float, default=1.0, help="Mixture weight: KL coefficient (beta)"
             )
@@ -1350,7 +1387,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--opsd-diversity-weight", type=float, default=0.5, help="Mixture weight: Diversity coefficient (rho)"
             )
             parser.add_argument(
-                "--opsd-temperature", type=float, default=1.0, help="Temperature for mixture weight computation"
+                "--opsd-temperature",
+                type=float,
+                default=1.0,
+                help=(
+                    "Temperature for mixture-weight computation (applied to "
+                    "p_θ and q_k inside the softmax used by Δ/h/g in §7). "
+                    "Default 1.0 ⇒ raw distributions (method.md is silent on "
+                    "temperature, so we keep it inert by default). Does NOT "
+                    "affect the final KL loss."
+                ),
             )
             parser.add_argument(
                 "--opsd-weight-top-k", type=int, default=512, help="Truncate vocab to top-K for mixture weights"
@@ -1359,12 +1405,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opsd-pointwise-kl-clip",
                 type=float,
-                default=None,
+                default=0.05,
                 help=(
-                    "Per-(position, vocab-entry) KL contribution cap (paper §3.2). "
+                    "Per-(position, vocab-entry) KL contribution cap (paper §3.2 / Figure 4). "
                     "Each term ℓ_{n,v} = q_v · (log q_v - log p_v) is clipped to this "
                     "value before summing over v; prevents stylistic tokens from dominating "
-                    "the distillation signal. None disables clipping."
+                    "the distillation signal. Default 0.05 matches the official OPSD "
+                    "training scripts. Pass a value <= 0 (e.g. -1) to disable."
                 ),
             )
             parser.add_argument(
@@ -1398,8 +1445,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="rank",
                 help=(
                     "Normalize Conf(τ) across a sample's candidates before adding to the "
-                    "quality score. `raw` uses the unnormalized log-prob (legacy); `rank` "
-                    "is recommended — robust to outliers and makes eta_c dimensionless."
+                    "quality score. method.md §4 specifies the *formula* but is silent on "
+                    "Conf's scale; raw Conf (mean log-prob, typically -5..-1 nats) "
+                    "dominates the structural terms in [0,1] and forces per-model η_c "
+                    "retuning. Default `rank` maps Conf to [0,1] so η_c becomes a true "
+                    "weight on a shared axis (this matches the default η_c=0.5 and "
+                    "method.md §13's choice of NOT listing η_c — its scale is decided by "
+                    "the normalization here). Pass `raw` for the literal method.md "
+                    "formula; `zscore`/`minmax` are intermediate options."
                 ),
             )
             parser.add_argument(
@@ -1750,6 +1803,15 @@ def slime_validate_args(args):
                 "--opsd-freeze-teacher and --opd-type=megatron both occupy the 'teacher' "
                 "weights tag for different purposes. Disable one of them."
             )
+
+    # Normalize "disabled" sentinels for OPSD KL clips: a non-positive threshold
+    # would clip every per-entry KL contribution to a non-positive value, which
+    # is almost certainly not what the user intended. Treat <= 0 as None so the
+    # autograd path takes the unclipped fast path.
+    if args.opsd_pointwise_kl_clip is not None and args.opsd_pointwise_kl_clip <= 0:
+        args.opsd_pointwise_kl_clip = None
+    if args.opsd_jsd_token_clip is not None and args.opsd_jsd_token_clip <= 0:
+        args.opsd_jsd_token_clip = None
 
     if args.megatron_to_hf_mode == "bridge":
         if (
