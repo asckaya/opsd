@@ -1401,17 +1401,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opsd-weight-top-k", type=int, default=512, help="Truncate vocab to top-K for mixture weights"
             )
-            parser.add_argument("--opsd-jsd-token-clip", type=float, default=None, help="Clip JSD per token")
             parser.add_argument(
-                "--opsd-pointwise-kl-clip",
+                "--opsd-jsd-token-clip",
                 type=float,
                 default=0.05,
                 help=(
-                    "Per-(position, vocab-entry) KL contribution cap (paper §3.2 / Figure 4). "
-                    "Each term ℓ_{n,v} = q_v · (log q_v - log p_v) is clipped to this "
-                    "value before summing over v; prevents stylistic tokens from dominating "
-                    "the distillation signal. Default 0.05 matches the official OPSD "
-                    "training scripts. Pass a value <= 0 (e.g. -1) to disable."
+                    "Per-position KL clamp applied AFTER sum-over-vocab (paper §3.2 / "
+                    "Figure 4 — matches the official OPSD scripts' --jsd_token_clip 0.05). "
+                    "Each per-token KL_n = Σ_v q_v · (log q_v - log p_v) is clamped to "
+                    "this value, capping the contribution of high-KL positions while "
+                    "preserving the per-token non-negativity guarantee. Pass <= 0 to disable."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-pointwise-kl-clip",
+                type=float,
+                default=None,
+                help=(
+                    "Per-(position, vocab-entry) KL contribution cap. Each term "
+                    "ℓ_{n,v} = q_v · (log q_v - log p_v) is clipped to this value "
+                    "BEFORE summing over v. NOTE: the clip is one-sided (replaces "
+                    "values >= clip with `clip`, leaves negative entries untouched), "
+                    "so the per-token sum can become negative when student diverges "
+                    "from teacher — prefer --opsd-jsd-token-clip for the paper-faithful "
+                    "behavior. Default disabled. Pass a value <= 0 to disable."
                 ),
             )
             parser.add_argument(
@@ -1479,25 +1492,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "updating learning policy'). When False, teacher forwards run against "
                     "the current student weights — legacy behavior; loses the implicit "
                     "regularization toward the initial policy."
-                ),
-            )
-            parser.add_argument(
-                "--opsd-student-pick",
-                type=str,
-                choices=["random", "non_privileged"],
-                default="random",
-                help=(
-                    "How to pick the single student-y trace from each group's K rollouts "
-                    "for training (method.md / paper Algorithm 1 line 5: one student "
-                    "rollout per prompt; paper's vLLM call uses `n=1`). The other K-1 "
-                    "traces are kept only as the privileged-candidate pool (for Conf, "
-                    "TopK_b, diversity selection, q_k^t teacher targets). "
-                    "`random`: uniform pick from the K — statistically equivalent to a "
-                    "fresh ŷ ∼ π_θ_old (paper's natural sampling, no bias). "
-                    "`non_privileged`: uniform pick from the K \\ selected-privileged "
-                    "subset — same cost, also avoids the degenerate case where the "
-                    "student y is itself one of the τ_k appearing in the teacher's "
-                    "privileged conditioning context."
                 ),
             )
             return parser
@@ -1837,11 +1831,11 @@ def slime_validate_args(args):
     # rollout_batch_size, and we need it to fit at least one global_batch_size
     # to make a gradient step. Three resolutions, all user-facing — surface a
     # clear error if none of them is in effect:
-    if hasattr(args, "opsd_student_pick"):
+    if hasattr(args, "opsd_k"):
         train_samples = args.rollout_batch_size
         if not args.use_dynamic_global_batch_size and train_samples < args.global_batch_size:
             raise ValueError(
-                f"OPSD picks 1 student-y per prompt (--opsd-student-pick={args.opsd_student_pick}), "
+                f"OPSD picks 1 student-y per prompt (out of K+1 rollouts), "
                 f"so train_batch == rollout_batch_size = {train_samples}, but "
                 f"--global-batch-size = {args.global_batch_size}. "
                 f"num_steps_per_rollout would floor to 0 and the rollout would be wasted. Fix:\n"

@@ -183,7 +183,16 @@ class OPSDPlugin(metaclass=SingletonMeta):
         kl_reduced = sum_of_sample_mean(flat_kl)  # per-sample masked-mean, summed
         distill_loss = kl_reduced * args.opsd_alpha
 
-        metrics: dict[str, torch.Tensor] = {"opsd_kl": kl_reduced.detach()}
+        metrics: dict[str, torch.Tensor] = {
+            "opsd_kl": kl_reduced.detach(),
+            # Diagnostic mirror: the raw forward-KL should be ≥ 0 by definition
+            # (and is when --opsd-jsd-token-clip is on). When the legacy
+            # --opsd-pointwise-kl-clip is enabled, the one-sided per-entry clip
+            # can drag the per-token sum below zero — this metric makes the
+            # "would-be non-negative" value visible alongside the raw one for
+            # comparison.
+            "opsd_kl_clamped": kl_reduced.detach().clamp_min(0),
+        }
         metrics.update(opsd_metrics)
 
         total_loss = distill_loss

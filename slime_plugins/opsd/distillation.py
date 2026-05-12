@@ -14,12 +14,21 @@ Steps executed inside the loss function:
 
 from __future__ import annotations
 
+import logging
 import math
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
+
+
+def _is_rank0() -> bool:
+    if not dist.is_available() or not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
 
 from slime.backends.megatron_utils.loss import get_responses
 
@@ -380,10 +389,49 @@ def mixture_weights(
 
     if N > 1:
         log_w = F.log_softmax(logits, dim=0)  # numerically stable
-        w_entropy = -(w * log_w).sum(0).clamp(min=0)  # [T] in nats
+        # Parenthesize the negation explicitly: Python's unary `-` has lower
+        # precedence than `.sum().clamp()`, so `-(w * log_w).sum(0).clamp(min=0)`
+        # parses as `-((w*log_w).sum(0).clamp(min=0))`. Since `w*log_w ≤ 0`,
+        # the .clamp(min=0) before the negation collapses to 0, then `-0 = -0.0`.
+        # The shape we want is `H(w) = -Σ w log w ≥ 0`, with clamp as a numerical
+        # guard AFTER the negation.
+        w_entropy = (-(w * log_w).sum(0)).clamp(min=0)  # [T] in nats
         w_entropy_norm = w_entropy / math.log(N)
     else:
         w_entropy_norm = torch.zeros(p_log.size(0), device=p_student.device)
+
+    if _is_rank0():
+        wn = w_entropy_norm.detach()
+        T = wn.numel()
+        nz = (wn > 1e-8).float().mean().item()
+
+        # Per-term stats across N teachers, then averaged over T tokens. The
+        # "spread" lines tell us which term dominates the softmax: if any of
+        # them has spread >> 1 across teachers, softmax saturates to one-hot.
+        d = delta.detach()
+        e = entropy.detach()
+        g = diversity.detach() if N > 1 else torch.zeros_like(d)
+        lg = logits.detach()
+        spread_d = (d.max(0).values - d.min(0).values).mean().item()
+        spread_e = (e.max(0).values - e.min(0).values).mean().item()
+        spread_g = (g.max(0).values - g.min(0).values).mean().item()
+        spread_lg = (lg.max(0).values - lg.min(0).values).mean().item()
+        logger.info(
+            "[opsd_dbg/mixture] N=%d T=%d temp=%.2f "
+            "weights(kl=%.2f,ent=%.2f,div=%.2f) "
+            "delta[mean=%.3f,max=%.3f,spread/t=%.3f] "
+            "entropy[mean=%.3f,max=%.3f,spread/t=%.3f] "
+            "diversity[mean=%.3f,max=%.3f,spread/t=%.3f] "
+            "logits_spread/t=%.3f "
+            "w_entropy_norm[mean=%.4f,max=%.4f,frac_nonzero=%.3f]",
+            N, T, args.opsd_temperature,
+            args.opsd_kl_weight, args.opsd_entropy_weight, args.opsd_diversity_weight,
+            d.mean().item(), d.max().item(), spread_d,
+            e.mean().item(), e.max().item(), spread_e,
+            g.mean().item(), g.max().item(), spread_g,
+            spread_lg,
+            wn.mean().item(), wn.max().item(), nz,
+        )
 
     return w, w_entropy_norm
 
@@ -808,22 +856,28 @@ def distillation_loss(
             per_token_kl.append(0.0 * p_student.sum(dim=-1))
             if per_token_rkl is not None:
                 per_token_rkl.append(0.0 * p_student.sum(dim=-1))
+            if _is_rank0():
+                logger.info("[opsd_dbg/sample] i=%d sample_out=None (no privileged)", i)
             continue
 
         V_local = p_student.size(1)
         shard_start = tp_rank * V_local  # global vocab offset for this TP rank
 
-        # Bring precomputed teacher logits back onto the student's device.
-        # If they were already on GPU (inline-from-loss path), this is a no-op.
-        sel_logits: list[torch.Tensor] = [t.to(device, non_blocking=True) for t in sample_out["sel_logits"]]
+        # Stream teacher logits one trace at a time: with N=4 / T=8192 / V≈152k,
+        # bulk-moving all N to GPU costs ~19 GB; we only need one [T, V_full]
+        # resident at a time. When sel_logits are already on GPU (inline path),
+        # `.to(device)` is a no-op and the originals persist via the list ref.
+        sel_src: list[torch.Tensor] = sample_out["sel_logits"]
 
         # §7 — mixture weights using this TP rank's local top-K student tokens.
         top_k = min(args.opsd_weight_top_k, V_local)
         _, weight_idx = torch.topk(p_student / args.opsd_temperature, k=top_k, dim=-1)  # [T, K]
         gathered_list: list[torch.Tensor] = []
-        for ltsr in sel_logits:
-            l_shard = ltsr[:, shard_start : shard_start + V_local]
+        for ltsr in sel_src:
+            l_gpu = ltsr.to(device, non_blocking=True)
+            l_shard = l_gpu[:, shard_start : shard_start + V_local]
             gathered_list.append(l_shard.gather(-1, weight_idx))
+            del l_shard, l_gpu
         q_gathered = torch.stack(gathered_list, dim=0)  # [N, T, K]
         del gathered_list
         w, w_entropy_norm = mixture_weights(args, p_student, q_gathered, weight_idx)
@@ -831,7 +885,8 @@ def distillation_loss(
 
         # §8 — q_mix for this TP rank's vocab shard [T, V_local].
         q_mix_local = torch.zeros(T, V_local, dtype=torch.float32, device=device)
-        for k, l_gpu in enumerate(sel_logits):
+        for k, ltsr in enumerate(sel_src):
+            l_gpu = ltsr.to(device, non_blocking=True)
             w_k = w[k]
             for t0 in range(0, T, _CHUNK_T):
                 t1 = min(t0 + _CHUNK_T, T)
@@ -840,7 +895,8 @@ def distillation_loss(
                 s_local = s_local * w_k[t0:t1].unsqueeze(-1)
                 q_mix_local[t0:t1].add_(s_local)
                 del s_full, s_local
-        del sel_logits, w
+            del l_gpu
+        del sel_src, w
 
         # §9 — KL(q_mix ‖ p_θ) via vocab-parallel custom autograd.
         kl = _VocabParallelKLDiv.apply(
@@ -865,8 +921,24 @@ def distillation_loss(
         loss_masks = batch.get("loss_masks")
         if loss_masks is not None:
             mask = loss_masks[i]
-            w_entropy_sum = w_entropy_sum + (w_entropy_norm * mask).sum()
-            w_entropy_count += int(mask.sum().clamp(min=1).item())
+            sample_we_sum = (w_entropy_norm * mask).sum()
+            sample_we_count = int(mask.sum().clamp(min=1).item())
+            w_entropy_sum = w_entropy_sum + sample_we_sum
+            w_entropy_count += sample_we_count
+            if _is_rank0():
+                # Per-sample tally — pairs with the mixture/N log to localize
+                # whether 0s come from N=1 (zeros tensor), mask=0 (zero rows),
+                # or live values diluted by big T (per-token mean ≈ 0).
+                logger.info(
+                    "[opsd_dbg/sample] i=%d resp_T=%d mask_sum=%.0f "
+                    "we_norm_mean=%.4f contrib_sum=%.4f contrib_count=%d",
+                    i,
+                    int(w_entropy_norm.numel()),
+                    float(mask.sum().item()),
+                    w_entropy_norm.detach().mean().item(),
+                    float(sample_we_sum.item()),
+                    sample_we_count,
+                )
         else:
             w_entropy_sum = w_entropy_sum + w_entropy_norm.sum()
             w_entropy_count += int(w_entropy_norm.numel())

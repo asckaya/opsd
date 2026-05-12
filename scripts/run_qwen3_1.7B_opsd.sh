@@ -50,14 +50,14 @@ ROLLOUT_ARGS=(
    # Table 8 evaluation params add top_p=0.95, top_k=-1 (slime default); the OPSD
    # reference scripts also pass top_k=20 to vLLM. We use top_k=20 here to match
    # the reference; flip to -1 if you want the eval-time setting.
-   --rollout-max-response-len 1024
+   --rollout-max-response-len 8192
    --rollout-temperature 1.1
    --rollout-top-p 0.95
    --rollout-top-k 20
 
    # Paper Table 6: EffectiveBatchSize = 32.
    --global-batch-size 32
-   --n-samples-per-prompt 1  # Base n_samples, OPSD rollout will override this to opsd_k
+   --n-samples-per-prompt 1  # Base n_samples; OPSD rollout overrides this to opsd_k+1 (1 student + K candidates)
 )
 
 # OPSD Plugin Arguments
@@ -71,7 +71,7 @@ OPSD_ARGS=(
 
    # OPSD Hyperparameters — tuned for throughput while staying inside
    # method.md §13 recommendations (K=8-32, N=2-4, K_b=8-16).
-   --opsd-k 16                # Sample 16 trajectories (K)
+   --opsd-k 16                # Privileged pool size (K). Rollout total = K+1 = 17 (1 student + 16 candidates)
    --opsd-n 4                 # Select 4 diverse traces (N) — method.md recommends 2-4
    --opsd-kb 8                # Pre-filter top 8 by quality (K_b) — halves q_forwards vs K_b=16
    --opsd-alpha 1.0           # L_distill weight (method.md §9). No GRPO baggage by default.
@@ -139,7 +139,7 @@ EVAL_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.35
+   --sglang-mem-fraction-static 0.3
 )
 
 MISC_ARGS=(

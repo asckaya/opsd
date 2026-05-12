@@ -117,7 +117,7 @@ diversity, hybrid GRPO+OPSD loss, RKL aux) are opt-in.
 
 | Argument | Default | Description |
 |---|---|---|
-| `--opsd-k` | `8` | Rollout samples per prompt (K) — method.md §13 range 8–32 |
+| `--opsd-k` | `8` | Privileged-pool size per prompt (K) — method.md §13 range 8–32. Total rollouts per prompt = K+1 (1 student + K candidates) |
 | `--opsd-n` | `2` | Diverse traces to select (N) — method.md §13 range 2–4 |
 | `--opsd-kb` | — | Pre-filter top-K_b by quality (method.md §13 range 8–16) |
 | `--opsd-alpha` | `1.0` | Scale on L_distill (method.md §9). Default loss is α·L_distill |
@@ -128,8 +128,8 @@ diversity, hybrid GRPO+OPSD loss, RKL aux) are opt-in.
 | `--opsd-diversity-weight` | `0.5` | Mixture weight ρ (diversity term) |
 | `--opsd-temperature` | `1.0` | Softening for mixture-weight computation only; does NOT affect the final KL |
 | `--opsd-weight-top-k` | `512` | Vocab truncation for weight computation |
-| `--opsd-jsd-token-clip` | — | Per-position KL clamp (post sum-over-vocab); rarely needed |
-| `--opsd-pointwise-kl-clip` | `0.05` | Per-(position, vocab-entry) ℓ_{n,v} cap (paper §3.2 / Figure 4 — matches official OPSD scripts). Pass `<= 0` to disable |
+| `--opsd-jsd-token-clip` | `0.05` | Per-position KL clamp post sum-over-vocab (paper §3.2 / Figure 4 — matches official OPSD scripts' `--jsd_token_clip 0.05`). Pass `<= 0` to disable |
+| `--opsd-pointwise-kl-clip` | — | Per-(position, vocab-entry) ℓ_{n,v} one-sided cap. NOTE: one-sided clip can drive per-token KL negative when student diverges; prefer `--opsd-jsd-token-clip`. Pass `<= 0` to disable |
 | `--opsd-fallback-to-gt` | `True` | Use GT trace when B_x is empty |
 | `--opsd-quality-len-weight` | `0.1` | η_l: length penalty |
 | `--opsd-quality-format-weight` | `0.2` | η_f: format penalty |

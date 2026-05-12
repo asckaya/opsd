@@ -1,11 +1,12 @@
 """Rollout phase for OPSD (method.md §2-3).
 
-Runs base rollout with K samples per prompt, filters to correct traces,
-selects one student y per group (method.md / paper Algorithm 1 line 5:
-one student rollout per prompt) and attaches privileged-candidate metadata
-for the training step.  The other K-1 traces stay only in the metadata as
-the privileged-candidate pool (used downstream for Conf, TopK_b, diversity
-and q_k^t teacher targets) — they are NOT trained on directly.
+Runs base rollout with K+1 samples per prompt: 1 is randomly chosen as the
+student-y for training, the other K form the privileged-candidate pool used
+downstream for Conf, TopK_b, diversity and q_k^t teacher targets. Roll-out
+size is K+1 (not K) so the student y is, by construction, never one of the
+τ_k feeding the teacher's privileged conditioning context — eliminating the
+"completion advantage" degeneracy where a teacher's KL(q_k‖p) collapses to
+zero because its privileged context already equals the student's response.
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ import random
 
 from slime.rollout.base_types import RolloutFnTrainOutput
 from slime.rollout.sglang_rollout import generate_rollout as base_generate_rollout
-from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,11 @@ def generate_rollout(args, rollout_id, data_source, tokenizer, evaluation: bool 
         return base_generate_rollout(args, rollout_id, data_source, evaluation=True)
 
     original_n = args.n_samples_per_prompt
-    args.n_samples_per_prompt = args.opsd_k
+    # Roll out K+1: 1 student trace + K candidates for the privileged pool.
+    # All K+1 are i.i.d. from π_θ_old, so any 1 picked at random is a fresh
+    # ŷ ∼ π_θ_old (paper-aligned), and the remaining K form a clean candidate
+    # pool that never contains the student trace.
+    args.n_samples_per_prompt = args.opsd_k + 1
     try:
         output = base_generate_rollout(args, rollout_id, data_source, evaluation=False)
     finally:
@@ -35,15 +39,22 @@ def generate_rollout(args, rollout_id, data_source, tokenizer, evaluation: bool 
         return output
 
     # Deterministic-but-per-rollout-different seeding: derive from rollout_id so
-    # the K→1 pick is reproducible across ranks (same rollout_id ⇒ same pick on
-    # every DP/TP rank, since base_generate_rollout returns the same group ordering).
+    # the (K+1)→1 pick is reproducible across ranks (same rollout_id ⇒ same pick
+    # on every DP/TP rank, since base_generate_rollout returns the same group
+    # ordering).
     rng = random.Random(rollout_id)
 
     new_samples: list = []
     for group in output.samples:
-        privileged, scores = _collect_privileged(args, group)
+        # All K+1 rollouts are statistically equivalent — random index avoids
+        # any positional bias from the rollout queue ordering.
+        student_idx = rng.randrange(len(group))
+        student = group[student_idx]
+        candidate_pool = [s for j, s in enumerate(group) if j != student_idx]
+
+        privileged, scores = _collect_privileged(args, candidate_pool)
         if not privileged and args.opsd_fallback_to_gt:
-            privileged = _gt_fallback(group, tokenizer)
+            privileged = _gt_fallback(candidate_pool, tokenizer)
             scores = [1.0] * len(privileged)
 
         meta = {
@@ -52,7 +63,6 @@ def generate_rollout(args, rollout_id, data_source, tokenizer, evaluation: bool 
             "problem_text": _extract_problem(group[0].prompt) if group else "",
         }
 
-        student = _pick_student(args, group, privileged, rng)
         if student.train_metadata is None:
             student.train_metadata = {}
         student.train_metadata.update(meta)
@@ -60,21 +70,6 @@ def generate_rollout(args, rollout_id, data_source, tokenizer, evaluation: bool 
 
     output.samples = new_samples
     return output
-
-
-def _pick_student(args, group, privileged, rng) -> Sample:
-    """Choose one trace from the group as the student-y for training.
-
-    See `--opsd-student-pick` arg docs for the rationale of each mode.
-    """
-    if args.opsd_student_pick == "non_privileged":
-        priv_set = {tuple(tr) for tr in privileged} if privileged else set()
-        candidates = [s for s in group if tuple(_response_tokens(s)) not in priv_set]
-        if candidates:
-            return rng.choice(candidates)
-        # All K traces were selected into the privileged set (rare: N == K).
-        # Fall through to uniform-from-K so we still produce a training sample.
-    return rng.choice(group)
 
 
 def _collect_privileged(args, group) -> tuple[list[list[int]], list[float]]:

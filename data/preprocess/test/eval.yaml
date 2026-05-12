@@ -1,0 +1,23 @@
+eval:
+  defaults:
+    max_response_len: 16384
+    top_p: 0.7
+    input_key: prompt
+    label_key: label
+  datasets:
+    - name: aime25
+      path: data/json/aime2025_test.jsonl
+      rm_type: deepscaler
+      n_samples_per_eval_prompt: 16
+    - name: amc
+      path: data/json/amc_test.jsonl
+      rm_type: deepscaler
+      n_samples_per_eval_prompt: 8
+    - name: mmlupro
+      path: data/json/mmlupro_test.jsonl
+      rm_type: gpqa
+      n_samples_per_eval_prompt: 8
+    - name: math500
+      path: data/json/math500_test.jsonl
+      rm_type: deepscaler
+      n_samples_per_eval_prompt: 8

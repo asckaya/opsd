@@ -723,7 +723,12 @@ def train(
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
 
             for param_group_id, param_group in enumerate(optimizer.param_groups):
-                log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
+                # Read the optimizer's actually-applied lr instead of asking the
+                # scheduler what it *would* schedule next — for custom-loss paths
+                # (e.g. OPSD) the scheduler's iteration counter may not advance
+                # the same way as in a standard PG loop, leaving get_lr() pinned
+                # at 0 even though the optimizer is stepping with a real lr.
+                log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = param_group["lr"]
 
             log_dict["train/step"] = accumulated_step_id
             logging_utils.log(args, log_dict, step_key="train/step")

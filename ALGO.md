@@ -1,162 +1,165 @@
 # OPSD 算法对齐说明
 
-本文件分两部分：
+本文件分三部分：
 
-1. **预期算法**（Part 1）——以 `method.md` 为准，并标注它和 `paper.md` 的关系。
-2. **当前实现状态**（Part 2）——所有原本的未对齐项现在的修复情况；项目自有改进保留为 **opt-in**，默认行为与 method.md 对齐、超参与 paper.md 对齐。
+1. **Part 1 — 算法规范**：以 `method.md` 为准；同时标注它和 `paper.md` 的关系。
+2. **Part 2 — 当前实现状态**：代码现在做了什么、为什么、和 paper / method 的偏差点。
+3. **Part 3 — 工程改进与 opt-in 旋钮**：项目自有扩展，默认行为对齐 paper / method，扩展全部 opt-in。
 
-历史版本记录的"未对齐项"已按用户要求全部修复，详见 Part 2 的"修复状态"列。
+历史 BUG.md 的全部条目（截断 / w_entropy=0 / KL<0 / mode-collapse 苗头 / lr-pg=0）均已在代码层面修复，下游影响详见 Part 2。
 
 ---
 
-## Part 1 ─ 预期算法（Expected Algorithm）
+## Part 1 — 算法规范（Source of truth: `method.md` + `paper.md`）
 
-> `paper.md` 的 OPSD 是单条 teacher 路径：teacher 直接看 ground-truth `y*`。
-> `method.md` 在此基础上做了扩展：用 *学生自己跑出来的正确轨迹* 当作 privileged 信息，并允许多条混合。
-> 也就是说：`method.md` ⊇ `paper.md`。`paper.md` 的训练循环可以看作 `method.md` 在 `N=1`、用 GT 当 privileged trace 时的特例。
+> `paper.md` 的 OPSD 是**单条 teacher 路径**：teacher 直接看 ground-truth `y*`。
+> `method.md` 在此基础上做了扩展：用 *学生自己跑出来的正确轨迹* 当作 privileged 信息，并允许多条 mixture。
+> 即 `method.md` ⊇ `paper.md`：paper 的训练循环可看作 method 在 `N=1`、`τ_k = y*` 时的特例。
 
-### 1.1 总流程（method.md §10）
+### 1.1 总流程（method.md §10，本仓 K+1 改造）
 
 对每个 prompt `x`：
 
-1. **On-policy rollout（§2）**：从旧策略 `π_{θ_old}(·|x)` 采样 `K` 条轨迹。
-2. **成功筛选（§3）**：`B_x = { τ_j | R(x, τ_j) = 1 }`；空则可 fallback 到 GT。
-3. **质量打分（§4）**：
+1. **On-policy rollout**：从旧策略 `π_{θ_old}(·|x)` 采样 **K+1** 条轨迹（`opsd_k+1` 条）。
+   - 1 条作为 student `y`；剩下 K 条进 candidate pool。
+   - 这样 `y` **不会出现在 candidate pool 中**，杜绝"student 恰好等于某条 τ_k"导致的 mixture 退化（详见 Part 2 §B.2）。
+2. **成功筛选（method.md §3）**：`B_x = { τ_j ∈ pool | R(x, τ_j) = 1 }`；空则 fallback 到 GT（`--opsd-fallback-to-gt`）。
+3. **质量打分（method.md §4）**：
    ```
    s(τ) = 1 − η_l · Len(τ)/L_max − η_f · FormatPenalty(τ) + η_c · Conf(τ)
    Conf(τ) = (1/|τ|) Σ_t log π_T(τ_t | x, τ_<t)
    ```
    保留 `B_x ← TopK(B_x, s, K_b)`。
-4. **多样性选择（§5）**：k-center greedy；距离推荐 token-level JSD：
-   `d_dist(τ_i,τ_j) = (1/T) Σ_t JSD(q_i^t, q_j^t)`。
-5. **学生采样**：复用 rollout 中的某一条轨迹作为 `y`。
-6. **Teacher 前向（§6）**：
+4. **多样性选择（method.md §5）**：k-center greedy；距离推荐 token-level JSD：
+   `d(τ_i, τ_j) = (1/T) Σ_t JSD(q_i^t, q_j^t)`。选出 `N` 条 → `P_x`。
+5. **Teacher 前向（method.md §6）**：
    ```
-   q_k^t = π_T(· | x, τ_k+, y_<t),    p^t = π_θ(· | x, y_<t)
+   q_k^t = π_T(· | x, τ_k+, y_<t),   p^t = π_θ(· | x, y_<t)
    ```
    `π_T` 由 `paper.md §4.1` 锁定为 **initial policy**（frozen），不随训练更新。
-7. **Teacher 混合权重（§7）**：
+6. **Mixture 权重（method.md §7）**：
    ```
    Δ_k^t = KL(q_k^t ‖ p^t),   h_k^t = H(q_k^t),   g_k^t = (1/(N−1)) Σ_{j≠k} JSD(q_k^t, q_j^t)
-   w_k^t ∝ exp(−β·Δ_k^t − γ·h_k^t + ρ·g_k^t)     ← softmax_k
+   w_k^t = softmax_k(−β·Δ_k^t − γ·h_k^t + ρ·g_k^t)
    ```
-8. **Mixture teacher（§8）**：`q_mix^t = Σ_k w_k^t · q_k^t`。
-9. **蒸馏目标（§9）**：
+   纯 raw 分布上做 softmax，**method.md 没有温度项**。
+7. **Mixture teacher（method.md §8）**：`q_mix^t = Σ_k w_k^t · q_k^t`。
+8. **蒸馏目标（method.md §9 / paper Eq.8）**：
    ```
-   L_distill = (1/T) Σ_t KL(q_mix^t ‖ p^t)             (主损失，forward KL)
-   L_total   = L_distill + α_RKL · Σ_t KL(p^t ‖ q_mix^t),    α_RKL ≪ 1   (可选 RKL 辅助)
+   L_distill = (1/T) Σ_t KL(q_mix^t ‖ p^t)             (主损失，forward KL，全词表)
+   L_total   = L_distill + α_RKL · Σ_t KL(p^t ‖ q_mix^t)        (可选 RKL 辅助，α_RKL ≪ 1)
    ```
-   `paper.md §3.2` + Figure 4：**逐 (位置, 词表项) pointwise clipping** 对长训练稳定性至关重要。
-   官方源码（`../OPSD/opsd_trainer.py:464`）实现是 `jsd.clamp(max=τ)`，等价于
-   ```
-   ℓ_{n,v} = q(v) · (log q(v) − log p(v))     ← forward KL 的 per-(pos,vocab) 项
-   D_clip = (1/|ŷ|) Σ_n Σ_v min(ℓ_{n,v}, τ)
-   ```
-   `f-散度` 的写法 `ℓ = p_T·f(p_S/p_T)` 在 `f(u)=−log u` 时也等价于上式。
+   `paper.md §3.2` + Figure 4：**per-position KL clamp `τ=0.05`** 对长训练稳定性至关重要（官方 `--jsd_token_clip 0.05`）。
 
-### 1.2 推荐超参（含来源）
+### 1.2 Paper Table 6 推荐超参
 
-| 来源 | 项 | 值 |
+| 项 | 值 | 来源 |
 |---|---|---|
-| method.md §13 | K（rollout 数） | 8–32 |
-| method.md §13 | N（多样性选中） | 2–4 |
-| method.md §13 | K_b（质量预筛） | 8–16 |
-| method.md §13 | β（KL 权） | 0.5–2 |
-| method.md §13 | γ（entropy 权） | 0.1–1 |
-| method.md §13 | ρ（diversity 权） | 0.1–1 |
-| method.md §13 | λ_distill（蒸馏权 α） | 0.05–0.5（在 L = L_RL + α·L_distill 框架下；纯蒸馏可取 1.0） |
-| paper.md Table 6 | Learning rate | 5e-6 |
-| paper.md Table 6 | Effective batch size | 32 |
-| paper.md Table 6 | LoRA r / α | 64 / 128（论文用 LoRA；slime Megatron 路径走全微调） |
-| paper.md Table 6 | Max completion length | 1024 |
-| paper.md Table 6 | Generations per prompt | 1（paper 的简化版） |
-| paper.md Table 6 | Sampling temperature | 1.1 |
-| paper.md Table 6 | Training steps | 100 |
-| paper.md Table 5 | 推荐风格 | **TM-off 学生 / TM-on 教师**（math token KL 信号最强） |
-| paper.md Table 8 | Eval：MaxNewTokens / TM / TopP / TopK / Temp | 38912 / on / 0.95 / −1 / 1.0 |
-| `../OPSD` 源码脚本 | per-(pos,vocab) clip τ | 0.05（`jsd_token_clip` in `run_opsd_1b.sh`） |
-| `../OPSD` 源码脚本 | top_p / top_k for sampling | 0.95 / 20 |
+| Learning rate | `5e-6` | Table 6 |
+| Effective batch size | `32` | Table 6 |
+| Max completion length | `1024`（数学推理可放宽到 4k–8k，paper 是短链场景） | Table 6 |
+| Generations per prompt | `1`（paper 简化为 single-y）；本仓 K+1 = 17 | Table 6 + 本仓扩展 |
+| Sampling temperature | `1.1` | Table 6 |
+| Top-p / Top-k | `0.95 / 20` | OPSD 官方训练脚本 |
+| KL clip τ | `0.05` | Paper §3.2 / `run_opsd_*.sh --jsd_token_clip 0.05` |
+| Training steps | `100` | Table 6 |
+| LoRA r / α | `64 / 128` | Table 6（slime 走全微调，不用 LoRA） |
+
+### 1.3 Method.md §13 推荐区间
+
+| 项 | 范围 | 含义 |
+|---|---|---|
+| K | 8–32 | 候选池大小 |
+| N | 2–4 | 多样性选中条数 |
+| K_b | 8–16 | 质量预筛 top-K_b |
+| β（KL 权） | 0.5–2 | mixture-weight 公式中 Δ 的系数 |
+| γ（entropy 权） | 0.1–1 | mixture-weight 公式中 h 的系数 |
+| ρ（diversity 权） | 0.1–1 | mixture-weight 公式中 g 的系数 |
+| λ_distill | 0.05–0.5 | "L_RL + λ·L_distill" 框架下的蒸馏权；纯蒸馏时取 1.0 |
 
 ---
 
-## Part 2 ─ 当前实现状态（Implementation Status）
+## Part 2 — 当前实现状态（Implementation Status）
 
-> 文件位置：`slime_plugins/opsd/`、`slime/utils/arguments.py`、`scripts/run_qwen3_1.7B_opsd*.sh`。
-> 状态符号：✅ 已修复且默认对齐 / 🔧 已修复但保留 opt-in 旋钮 / 📌 文档/约定明确，无代码变更。
+### A. 与 paper.md / method.md 的核心对齐项
 
-### A. 关键语义偏差 — 已修复
-
-| 项 | 状态 | 修复 |
-|---|---|---|
-| A.1 OPSD loss 与 GRPO PG-loss 杂交 | ✅ + 🔧 | `plugin.py:loss_function` 默认是 **纯** `α·KL(q_mix‖p_θ)`（method.md §9 / paper Eq 8）。新增 `--opsd-mix-with-policy-loss`（默认 `False`）保留旧 hybrid 行为以做消融。`opsd_alpha` 现在严格是 method.md §9 的 `L_distill` 系数。 |
-| A.2 默认不开 per-(pos,vocab) KL clip | ✅ | `--opsd-pointwise-kl-clip` 默认从 `None` 改成 **`0.05`**（与官方 `../OPSD/scripts/run_opsd_*.sh --jsd_token_clip 0.05` 一致；paper §3.2 Fig.4 强调长训练必需）。传 `<= 0`（如 `-1`）显式关闭，由 `arguments.py` 的后处理统一规整成 `None`。 |
-| A.3 mixture-weight 计算有温度软化 | 📌 | `opsd_temperature` 默认 1.0，纯 raw 分布。文档（README / argparse help）现已写明"只对 Δ/h/g 的 softmax 起作用，不影响最终 KL 损失"。 |
-| A.4 Conf 默认 rank 归一化 | 🔧（保留） | `--opsd-quality-conf-norm` 默认仍然是 **`rank`**。理由：method.md §4 只给公式，没说 Conf 的 numerical scaling；raw Conf（mean log-prob，-5..-1 nats）会盖过 `Len/L_max` 和 `Format`（都在 [0, 1]）一个量纲，让默认 `η_c = 0.5` 失去"权重"语义。`rank` 把它压到 [0, 1] 与其它项共享数轴。这也解释了为什么 method.md §13 推荐超参表 *不* 列 η_c——它的 scale 由这里的归一化方案决定。`raw` 是 opt-in：纯字面照搬 method.md 公式时用。 |
-| A.5 method.md §9 的 RKL 辅助项缺失 | ✅ | 新增 `--opsd-rkl-weight`（默认 `0.0`）。打开后跑一个 vocab-parallel 的 `KL(p_θ‖q_mix)` 全 vocab 反向（`distillation.py:_VocabParallelRKLDiv`），加到总 loss 上并日志为 `opsd_rkl_loss`。method.md 推荐 `α_RKL ≪ 1`，所以默认关闭。 |
-
-### B. paper.md Table 6 超参 — 脚本已对齐
-
-修改 `scripts/run_qwen3_1.7B_opsd.sh` 与 `scripts/run_qwen3_1.7B_opsd_split.sh`：
-
-| 项 | 老值 | 新值（paper Table 6） |
-|---|---|---|
-| `--lr` | `1e-6` | **`5e-6`** |
-| `--global-batch-size` | `128` | **`32`** |
-| `--rollout-max-response-len` | `2048` | **`1024`** |
-| `--rollout-temperature` | `1.0` | **`1.1`** |
-| `--rollout-top-p` | （未设） | **`0.95`** |
-| `--rollout-top-k` | （未设） | **`20`** |
-| `--opsd-diversity-metric` | `unigram_jsd`（脚本覆盖） | （删除覆盖，走默认 `token_jsd`） |
-| `--opsd-temperature` | `1.0`（脚本显式传） | （删除，复用默认 1.0） |
-
-`LoRA r/α`：slime 的 Megatron 路径用全微调，不走 LoRA。LR `5e-6` 对全微调可能偏大，但保持与 paper 一致；若需要更稳可在脚本里再降一档，但这就脱离 paper 复现轨了。
-
-### C. method.md §13 范围 — 全部满足
-
-| 项 | 脚本现值 | method.md §13 范围 | 备注 |
+| 项 | 状态 | 默认值 | 备注 |
 |---|---|---|---|
-| K | 16 | 8–32 | ✓ |
-| N | 4 | 2–4 | ✓ |
-| K_b | 8 | 8–16 | ✓ |
-| β (`opsd_kl_weight`) | 1.0 | 0.5–2 | ✓ |
-| γ (`opsd_entropy_weight`) | 0.5 | 0.1–1 | ✓ |
-| ρ (`opsd_diversity_weight`) | 0.5 | 0.1–1 | ✓ |
-| `opsd_alpha`（纯蒸馏 loss 系数） | 1.0 | — | method.md §13 的 0.05–0.5 是在"L_RL + α·L_distill"框架下；现在我们是纯蒸馏，1.0 即"原 loss"，等价。 |
+| 主损失 = `α·KL(q_mix‖p_θ)` | ✅ | `α=1.0` | `plugin.py:loss_function`。`--opsd-mix-with-policy-loss` 默认 False（无 GRPO 杂交） |
+| frozen initial-policy teacher | ✅ | `--opsd-freeze-teacher=True` | `plugin.py:before_train_step_hook` 路径 B：训练前快照 → swap-back |
+| K+1 rollout，1 学生 + K 候选 | ✅ | `opsd_k+1` | `rollout.py:generate_rollout`；学生不再出现在 candidate pool |
+| Mixture-weight 无温度 | ✅ | `--opsd-temperature=1.0` | `mixture_weights` 里 `/ T` 默认 T=1.0 等价 raw |
+| Per-position KL clamp `τ=0.05` | ✅ | `--opsd-jsd-token-clip=0.05` | 对应 paper `--jsd_token_clip 0.05`；post sum-over-vocab，保证非负 |
+| Per-(pos,vocab) clip 默认关 | ✅ | `--opsd-pointwise-kl-clip=None` | 该 clip 单边性会让 KL 走负（BUG.md #3），保留 opt-in 但不默认 |
+| Forward-KL 主，RKL 可选 | ✅ | `--opsd-rkl-weight=0.0` | `_VocabParallelRKLDiv` 实现，paper `α_RKL ≪ 1` |
+| token_jsd 多样性距离 | ✅ | `--opsd-diversity-metric=token_jsd` | method.md §5 推荐 |
+| Quality 三项 + Conf 归一 | ✅ + 🔧 | conf-norm=`rank` | method.md §4 公式；Conf 跨候选归一 [0,1]（详见 §C） |
 
-### D. 项目自有的工程改进 — 保留为 opt-in
+### B. BUG.md 的修复（按编号）
 
-| 改进 | 实现位置 | 触发方式 |
+| BUG | 问题 | 根因 | 修复 |
+|---|---|---|---|
+| #1 | 99% rollout 截断、reward 全 0、训练无信号 | 1.7B math 推理需要 >1024 token，paper Table 6 的 1024 不够 | `scripts/run_qwen3_*_opsd.sh`：`--rollout-max-response-len` 提到 8192 |
+| #2 | `train/opsd_w_entropy ≡ 0`，mixture 看似一直 collapse | `distillation.py:392` 操作符优先级：`-(w*log_w).sum(0).clamp(min=0)` 解析为 `-((w*log_w).sum(0).clamp(min=0))`，先把负的 sum clamp 到 0，再取负得 -0.0 | 加显式括号：`(-(w * log_w).sum(0)).clamp(min=0)` |
+| #3 | `train/opsd_kl` 单调走负 | `_VocabParallelKLDiv` 里 per-(pos,vocab) clip 是单边的（只压正项 ≥ τ，不动负项），可让 sum-over-vocab 变负 | (a) 默认值对调：`opsd-pointwise-kl-clip` `0.05 → None`，`opsd-jsd-token-clip` `None → 0.05`（paper-faithful per-position clamp）；(b) 加 `metrics["opsd_kl_clamped"] = max(0, kl)` 镜像监控 |
+| #4 | mode collapse 苗头（student log_probs 越来越自信） | #3 让 reverse 推力被削弱 | 期望 #3 修好后缓解；监控 `train/opsd_kl` 持续 ≥ 0 即可 |
+| #5 | `train/lr-pg_0/1 = 0` | 读的是 `opt_param_scheduler.get_lr(...)` 计划值，不是 optimizer 实际生效值 | `model.py:731` 改读 `param_group["lr"]` |
+| 衍生 | "学生 = privileged trace" 退化（mixture one-hot） | 旧代码学生从 K 中随机挑，且 candidate pool 也是 K，K=16 全对组里 100% 重叠 | **K+1 设计**：rollout 17 条，1 学生 + 16 候选，从结构上隔开 |
+
+### C. 仍是项目自有约定（method.md 未严格规定，写在这里以免后人翻代码）
+
+| 约定 | 位置 | 理由 |
 |---|---|---|
-| `unigram_jsd` 多样性距离（提前 diversity 选择以减少 q-forward） | `selection.py:pairwise_unigram_jsd`、`distillation.py:prepare_teacher_outputs` | `--opsd-diversity-metric unigram_jsd`（默认 `token_jsd`） |
-| Conf 跨候选归一化（`rank` 默认）；`zscore` / `minmax` / `raw` 可选 | `distillation.py:add_conf` | `--opsd-quality-conf-norm <mode>`（默认 `rank`） |
-| `_VocabParallelKLDiv` 的 per-(pos,vocab) clip | `distillation.py` | `--opsd-pointwise-kl-clip <τ>`（默认 `0.05`） |
-| sum-后 token-level KL clamp（与 paper 的 pointwise clip 不同的一个钝刀防御） | `distillation.py:distillation_loss` | `--opsd-jsd-token-clip <c>`（默认关闭） |
-| 顶 K 词表近似计算 Δ/h/g、JSD 距离 | `distillation.py:mixture_weights`、`selection.py:_seq_jsd` | `--opsd-weight-top-k`、`--opsd-diversity-top-k`（保留默认） |
-| Hybrid 法：在纯蒸馏之外叠加 GRPO PG-loss | `plugin.py` | `--opsd-mix-with-policy-loss`（默认 `False`） |
-| RKL 辅助项 `α_RKL · KL(p_θ‖q_mix)` | `distillation.py:_VocabParallelRKLDiv` | `--opsd-rkl-weight <α_RKL>`（默认 0.0） |
-| Mixture-weight 温度软化 | `distillation.py:mixture_weights` | `--opsd-temperature <T>`（默认 1.0，等价 raw） |
-
-### E. 文档/接口收尾
-
-- `slime_plugins/opsd/README.md`：超参表已更新到新默认值；Performance notes 中关于"unigram_jsd 是脚本默认"的说法已改正；新增"External teacher"一节，说明 `--no-opsd-freeze-teacher --use-opd --opd-type megatron --opd-teacher-load <path>` 接外部教师的用法（这不再是 OPSD，是普通 KD，用于明确边界）。
-- `slime_plugins/opsd/{selection.py, distillation.py, rollout.py}`、README：把残留的 `metho.md` 链接改成 `method.md`（项目里实际文件名）。
-- `slime_plugins/opsd/PLAN_FROZEN_TEACHER.md` 仍残留 `metho.md` 字样，是历史 plan 文档，未触碰。
+| Conf 跨候选 `rank` 归一化 | `distillation.py:add_conf` | method.md §4 只给 `Conf = mean log-prob`，没指 numerical scaling。raw Conf 在 [-5,-1] nats 量纲会盖过 Len/Format（[0,1] 量纲），让默认 `η_c=0.5` 失去"权重"语义。`rank → [0,1]` 让三项共享数轴。可用 `--opsd-quality-conf-norm raw` 还原字面行为 |
+| 顶 K=512 词表近似 mixture 权重 | `distillation.py:mixture_weights` | full-vocab 在 N=4 / T=8k 下显存爆。method.md 没限定，工程妥协。可调 `--opsd-weight-top-k` |
+| GT-fallback 当 candidate 全错 | `rollout.py:_collect_privileged` | method.md §3 说"can fallback to GT"，没限定形式；本仓拿 label 直接 encode 当 1 条 trace |
 
 ---
 
-## 与 slime 内置 `--use-opd` 的关系（解释）
+## Part 3 — 工程改进与 opt-in 旋钮
 
-slime 自带的 `--use-opd / --opd-kl-coef` 走的是 **paper §3.2 末尾的 Alternative objective (Eq 9)**——采样 token 的 policy-gradient 形态，把 `reverse_kl = log π_S − log π_T` 当 advantage 修正项 (`apply_opd_kl_to_advantages`)。它和我们的 plugin 走的 main objective 不一样：
+| 改进 | 文件 | 触发方式 | 默认 |
+|---|---|---|---|
+| Hybrid（蒸馏 + GRPO PG） | `plugin.py` | `--opsd-mix-with-policy-loss` | False（paper 是替代 GRPO，不是叠加） |
+| RKL 辅助项 | `distillation.py:_VocabParallelRKLDiv` | `--opsd-rkl-weight <α_RKL>` | 0.0（关） |
+| Mixture-weight 温度软化 | `distillation.py:mixture_weights` | `--opsd-temperature <T>` | 1.0（raw） |
+| Per-(pos,vocab) KL clip（已知有副作用） | `distillation.py:_VocabParallelKLDiv` | `--opsd-pointwise-kl-clip <τ>` | None（关） |
+| `unigram_jsd` 提前多样性选择，省 q-forward | `selection.py`、`distillation.py:prepare_teacher_outputs` | `--opsd-diversity-metric unigram_jsd` | `token_jsd` |
+| Conf 归一化模式 | `distillation.py:add_conf` | `--opsd-quality-conf-norm rank/zscore/minmax/raw` | `rank` |
+| 顶 K 词表近似（mixture / JSD） | `distillation.py`、`selection.py` | `--opsd-weight-top-k`、`--opsd-diversity-top-k` | 512 / 128 |
+| Frozen-teacher 关闭（学生即 teacher） | `plugin.py` | `--no-opsd-freeze-teacher` | True |
+| 外部教师（不再是 OPSD，是普通 KD） | `plugin.py` + slime `--use-opd` | `--no-opsd-freeze-teacher --use-opd --opd-type megatron --opd-teacher-load <path>` | 不启用 |
 
-- slime `--use-opd`：单 teacher、采样 token 级 PG 信号，一个 token 一个标量 reward。
-- 本 plugin：N teacher mixture、**full-vocab** forward-KL 信号，每个 token 在全词表上稠密。
+### 与 slime 内置 `--use-opd` 的关系
 
-它们的 teacher 加载基础设施可以共用：本 plugin `actor.py:111-118` 已经允许 `--no-opsd-freeze-teacher --use-opd --opd-type megatron --opd-teacher-load <path>` 把外部 checkpoint 装进 `"teacher"` tag。但语义上："外部教师 + mixture full-vocab KL" 不再是 OPSD 自蒸馏，是普通 KD 的一个变体——按需自取。
+slime 自带的 `--use-opd / --opd-kl-coef` 实现的是 **paper §3.2 末尾的 alternative objective (Eq.9)**——在采样 token 上做 PG-flavored 修正，把 `reverse_kl = log π_S − log π_T` 当 advantage 修正项 (`apply_opd_kl_to_advantages`)。它和本 plugin 走的 main objective 不一样：
+
+- slime `--use-opd`：单 teacher、采样 token 级 PG，每 token 一个标量信号。
+- 本 plugin：N teacher mixture、**full-vocab** forward-KL，每 token 在全词表上稠密。
+
+teacher 装载基础设施可共用（同一个 `"teacher"` weight tag）；语义边界保留在 `--opsd-freeze-teacher` 这个旋钮上。
+
+---
+
+## Part 4 — 健康监控（TB / stdout 速查）
+
+| 指标 | 健康范围 | 异常含义 |
+|---|---|---|
+| `rollout/raw_reward` | 0.3–0.9 | 太低 → student 太弱 / 数据太难 / 截断；太高 → group 全对，mixture 失多样性 |
+| `rollout/truncated_ratio` | < 0.1 | 高 → response_len 设小了，参考 BUG.md #1 |
+| `rollout/zero_std/count_0+count_1` | < `rollout-batch-size` | == batch 说明所有 group std=0，OPSD 输入退化 |
+| `train/opsd_kl` | ≥ 0 单调向稳定值 | 走负 → BUG.md #3，确认 `--opsd-pointwise-kl-clip` 未误开 |
+| `train/opsd_kl_clamped` | == `opsd_kl` | 不等 → 上一行违例时的镜像 |
+| `train/opsd_w_entropy` | 0.3–0.8 | 0 → mixture 在 one-hot；1 → 完全均匀，β 太小或诊断 bug 重现；调 `--opsd-kl-weight` ±2× |
+| `train/lr-pg_0/1` | == `--lr` | 0 → BUG.md #5 修了；若仍为 0，说明 `param_group["lr"]` 未由 scheduler 写入 |
+| `train/grad_norm` | 0.1–1.0 | 太大 → KL clip 没生效或 RKL 过强；太小 → 训练信号弱 |
 
 ---
 
 ## TL;DR
 
-- **默认行为**：method.md / paper.md main objective 对齐——纯 full-vocab forward-KL 蒸馏，frozen 初始策略 teacher，per-(pos,vocab) clip τ=0.05，token_jsd 多样性，raw Conf。
-- **超参**：脚本完全按 paper Table 6（LR 5e-6 / batch 32 / max-len 1024 / temp 1.1 / top-p 0.95 / top-k 20）。
-- **项目自有改进**：全部保留为 opt-in 旋钮，默认关闭，详见 Part 2 §D。
+- **默认行为**：method.md §6-9 主路径 + paper §3.2 per-position KL clip τ=0.05。frozen initial-policy teacher，full-vocab forward-KL，token_jsd 多样性，`rank` 归一 Conf。
+- **Rollout 设计**：每 prompt 跑 K+1 条，1 当 student、K 当 candidate pool（学生不在池中）。
+- **超参**：脚本 paper Table 6 对齐（lr 5e-6 / batch 32 / temp 1.1 / top-p 0.95 / top-k 20）；`--rollout-max-response-len` 因数学推理需要从 1024 调高到 8192。
+- **项目改进**：全部 opt-in，详见 Part 3。
+- **Bug 修复**：BUG.md 全部条目落代码，详见 Part 2 §B。
