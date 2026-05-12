@@ -3,7 +3,7 @@
 # Standalone OPSD eval driver — launches a sglang server, runs eval_sglang.py
 # against the configured datasets, writes a timestamped JSON to ./eval_results/.
 #
-# Defaults align with paper.md Table 8 (eval-time sampling):
+# Defaults align with paper Table 8 (eval-time sampling):
 #   max_new_tokens=38912 (override via dataset-level max_response_len in YAML)
 #   top_p=0.95, top_k=-1 (slime default), temperature=1.0
 #

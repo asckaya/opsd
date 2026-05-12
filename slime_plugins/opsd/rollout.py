@@ -1,4 +1,4 @@
-"""Rollout phase for OPSD (method.md §2-3).
+"""Rollout phase for OPSD (ALGO.md Part 1 §2-3).
 
 Runs base rollout with K+1 samples per prompt: 1 is randomly chosen as the
 student-y for training, the other K form the privileged-candidate pool used
@@ -94,7 +94,7 @@ def _gt_fallback(group, tokenizer) -> list[list[int]]:
 
 
 def _structural_score(args, sample) -> float:
-    """s(τ) without conf: 1 - η_l·len/L_max - η_f·format_penalty (method.md §4)."""
+    """s(τ) without conf: 1 - η_l·len/L_max - η_f·format_penalty (ALGO.md Part 1 §4)."""
     score = 1.0
     max_len = max(args.rollout_max_response_len, 1)
     resp_len = sample.response_length if sample.response_length else len(sample.tokens)

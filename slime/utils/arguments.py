@@ -1335,8 +1335,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_opsd_arguments(parser):
             """Add OPSD specific arguments.
 
-            Defaults align with method.md (the project's source-of-truth method
-            spec).  Where method.md is silent, defaults align with paper.md
+            Defaults align with ALGO.md Part 1 (the project's source-of-truth method
+            spec).  Where ALGO.md Part 1 is silent, defaults align with paper
             (the published OPSD paper) — in particular the per-(pos,vocab) KL
             clip τ defaults to 0.05, matching the OPSD reference scripts.
             """
@@ -1350,7 +1350,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=1.0,
                 help=(
-                    "Scale on the OPSD distillation loss L_distill (method.md §9). "
+                    "Scale on the OPSD distillation loss L_distill (ALGO.md Part 1 §9). "
                     "With --opsd-mix-with-policy-loss off (default) the *only* loss "
                     "is α · L_distill, so 1.0 is the method-aligned default."
                 ),
@@ -1360,7 +1360,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=0.0,
                 help=(
-                    "Optional reverse-KL auxiliary weight (method.md §9: "
+                    "Optional reverse-KL auxiliary weight (ALGO.md Part 1 §9: "
                     "L_total = L_distill + α_RKL·L_RKL, α_RKL ≪ 1). 0 disables. "
                     "When set, an additional vocab-parallel KL(p_θ‖q_mix) is "
                     "computed and added to the loss."
@@ -1372,7 +1372,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help=(
                     "Add the GRPO policy-gradient loss on top of the OPSD "
-                    "distillation loss. OFF by default — paper.md's OPSD is a "
+                    "distillation loss. OFF by default — paper's OPSD is a "
                     "replacement for GRPO, not a side signal. Keep this flag "
                     "for ablations only."
                 ),
@@ -1393,7 +1393,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Temperature for mixture-weight computation (applied to "
                     "p_θ and q_k inside the softmax used by Δ/h/g in §7). "
-                    "Default 1.0 ⇒ raw distributions (method.md is silent on "
+                    "Default 1.0 ⇒ raw distributions (ALGO.md Part 1 is silent on "
                     "temperature, so we keep it inert by default). Does NOT "
                     "affect the final KL loss."
                 ),
@@ -1458,13 +1458,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="rank",
                 help=(
                     "Normalize Conf(τ) across a sample's candidates before adding to the "
-                    "quality score. method.md §4 specifies the *formula* but is silent on "
+                    "quality score. ALGO.md Part 1 §4 specifies the *formula* but is silent on "
                     "Conf's scale; raw Conf (mean log-prob, typically -5..-1 nats) "
                     "dominates the structural terms in [0,1] and forces per-model η_c "
                     "retuning. Default `rank` maps Conf to [0,1] so η_c becomes a true "
                     "weight on a shared axis (this matches the default η_c=0.5 and "
-                    "method.md §13's choice of NOT listing η_c — its scale is decided by "
-                    "the normalization here). Pass `raw` for the literal method.md "
+                    "ALGO.md Part 1 §13's choice of NOT listing η_c — its scale is decided by "
+                    "the normalization here). Pass `raw` for the literal ALGO.md Part 1 "
                     "formula; `zscore`/`minmax` are intermediate options."
                 ),
             )
@@ -1827,7 +1827,7 @@ def slime_validate_args(args):
         args.opsd_jsd_token_clip = None
 
     # OPSD always reduces to 1 student trace per prompt for training
-    # (method.md / paper Algorithm 1 line 5). That means train_batch =
+    # (ALGO.md Part 1 / paper Algorithm 1 line 5). That means train_batch =
     # rollout_batch_size, and we need it to fit at least one global_batch_size
     # to make a gradient step. Three resolutions, all user-facing — surface a
     # clear error if none of them is in effect:

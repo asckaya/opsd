@@ -135,11 +135,11 @@ class OPSDPlugin(metaclass=SingletonMeta):
     # ── loss ──────────────────────────────────────────────────────────────────
 
     def loss_function(self, args, batch, logits, sum_of_sample_mean):
-        """OPSD distillation loss (method.md §9, paper.md Eq 8).
+        """OPSD distillation loss (ALGO.md Part 1 §9, paper Eq 8).
 
         Default behavior: pure full-vocabulary forward-KL distillation —
         ``L = α · (1/T) Σ_t KL(q_mix^t ‖ p_θ^t)``, with optional reverse-KL
-        auxiliary (method.md §9, ``α_RKL << 1``).  Reduction goes through
+        auxiliary (ALGO.md Part 1 §9, ``α_RKL << 1``).  Reduction goes through
         slime's ``sum_of_sample_mean`` so it integrates with Megatron grad
         accumulation the same way ``sft_loss_function`` does.
 
@@ -197,7 +197,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
 
         total_loss = distill_loss
 
-        # Optional method.md §9 reverse-KL auxiliary.
+        # Optional ALGO.md Part 1 §9 reverse-KL auxiliary.
         rkl_weight = getattr(args, "opsd_rkl_weight", 0.0)
         if rkl_weight > 0 and per_token_rkl is not None:
             flat_rkl = torch.cat(per_token_rkl, dim=0)

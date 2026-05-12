@@ -1,4 +1,4 @@
-"""Training-side OPSD logic (method.md §4-9).
+"""Training-side OPSD logic (ALGO.md Part 1 §4-9).
 
 Steps executed inside the loss function:
   §4  Add conf term to quality scores; apply TopK_b filter.
@@ -213,7 +213,7 @@ def compute_trace_confs(
     conf_inputs: list[torch.Tensor],
     trace_tokens_flat: list[torch.Tensor],
 ) -> list[float]:
-    """Conf(τ_k) = (1/|τ_k|) Σ_t log π_T(τ_k[t] | x, τ_k[<t]) — method.md §4.
+    """Conf(τ_k) = (1/|τ_k|) Σ_t log π_T(τ_k[t] | x, τ_k[<t]) — ALGO.md Part 1 §4.
 
     One forward pass per trace over `chat(x) + τ_k`. Reads logits at positions
     [P-1, P+|τ|-1) where P = len(chat(x)), then evaluates the log-prob of
@@ -269,7 +269,7 @@ def add_conf(
     """Add η_c·Conf(τ) to structural quality scores.
 
     Conf(τ) = (1/|τ|) Σ_t log π_T(τ_t | x, τ_<t) — the teacher's mean log-prob
-    on the trace itself, pre-computed by `compute_trace_confs` per method.md §4.
+    on the trace itself, pre-computed by `compute_trace_confs` per ALGO.md Part 1 §4.
 
     Raw Conf is in log-prob units (typically -5..-1 nats), incommensurable with
     the structural terms which live in [0, 1]. We normalize Conf across the
@@ -323,7 +323,7 @@ def select_diverse(
     logits_cpu: list[torch.Tensor] | None,
     device: torch.device,
 ) -> list[int]:
-    """Select N diverse candidates via k-center greedy (method.md §5).
+    """Select N diverse candidates via k-center greedy (ALGO.md Part 1 §5).
 
     `logits_cpu` is required only for the token_jsd metric; it may be None when
     the metric is unigram_jsd (token-only distance, no q logits needed).
@@ -350,7 +350,7 @@ def mixture_weights(
     q_gathered: torch.Tensor,
     weight_idx: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute per-token mixture weights w_k^t (method.md §7).
+    """Compute per-token mixture weights w_k^t (ALGO.md Part 1 §7).
 
     w_k^t ∝ exp(-β·Δ_k^t - γ·h_k^t + ρ·g_k^t)
 
@@ -623,7 +623,7 @@ class _VocabParallelKLDiv(torch.autograd.Function):
 class _VocabParallelRKLDiv(torch.autograd.Function):
     """Reverse-KL: KL(p_θ ‖ q_mix), vocab-parallel.
 
-    Per position n: ``L_n = Σ_v p_v (log p_v − log q_v)``.  Used as method.md
+    Per position n: ``L_n = Σ_v p_v (log p_v − log q_v)``.  Used as ALGO.md Part 1
     §9's optional auxiliary term `L_RKL` (with ``α << 1``).  The full forward-KL
     above remains the dominant signal; this op exists so users who want the
     auxiliary can opt in via ``--opsd-rkl-weight > 0``.
@@ -824,11 +824,11 @@ def distillation_loss(
                         tensor that still flows gradient through `student_logits`
                         (so autograd hooks fire on every rank).  The caller
                         concatenates these and feeds to `sum_of_sample_mean`
-                        for Megatron-friendly reduction (method.md §9 token-
+                        for Megatron-friendly reduction (ALGO.md Part 1 §9 token-
                         mean → sample-mean → batch-sum).
         per_token_rkl:  None when ``--opsd-rkl-weight == 0``; otherwise a list
                         of [T_i] tensors carrying the reverse-KL contribution
-                        per sample (method.md §9 auxiliary).
+                        per sample (ALGO.md Part 1 §9 auxiliary).
         metrics:        dict of detached scalar tensors for logging
                         (currently just ``opsd_w_entropy``).
     """
@@ -908,9 +908,9 @@ def distillation_loss(
 
         per_token_kl.append(kl)
 
-        # Optional method.md §9 reverse-KL aux: KL(p_θ ‖ q_mix), full vocab.
+        # Optional ALGO.md Part 1 §9 reverse-KL aux: KL(p_θ ‖ q_mix), full vocab.
         # The *main* gradient signal still comes from the forward-KL above
-        # (α << 1 in method.md §9), so this is composed in plugin.py rather
+        # (α << 1 in ALGO.md Part 1 §9), so this is composed in plugin.py rather
         # than added here.
         if per_token_rkl is not None:
             rkl = _VocabParallelRKLDiv.apply(p_student, q_mix_local.detach(), tp_group, _CHUNK_T)
