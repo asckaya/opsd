@@ -198,7 +198,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
         total_loss = distill_loss
 
         # Optional ALGO.md Part 1 §9 reverse-KL auxiliary.
-        rkl_weight = getattr(args, "opsd_rkl_weight", 0.0)
+        rkl_weight = args.opsd_rkl_weight
         if rkl_weight > 0 and per_token_rkl is not None:
             flat_rkl = torch.cat(per_token_rkl, dim=0)
             rkl_reduced = sum_of_sample_mean(flat_rkl)
@@ -209,7 +209,7 @@ class OPSDPlugin(metaclass=SingletonMeta):
         # Optional legacy hybrid: add GRPO PG-loss on top.  Off by default
         # because the paper's OPSD is a *replacement* for GRPO, not a side
         # signal — keeping this around only for ablations.
-        if getattr(args, "opsd_mix_with_policy_loss", False):
+        if args.opsd_mix_with_policy_loss:
             base_loss, pg_metrics = policy_loss_function(args, batch, logits, sum_of_sample_mean)
             total_loss = total_loss + base_loss
             metrics.update(pg_metrics)

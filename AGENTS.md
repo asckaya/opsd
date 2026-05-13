@@ -39,8 +39,8 @@ Source-of-truth files (read in this order):
 | Quality scoring (Len + Format + Conf) | `slime_plugins/opsd/rollout.py:_structural_score` + `distillation.py:add_conf` |
 | Diversity selection | `slime_plugins/opsd/selection.py:kcenter` |
 | Mixture weights w_k^t | `slime_plugins/opsd/distillation.py:mixture_weights` |
-| Forward-KL custom autograd | `slime_plugins/opsd/distillation.py:_VocabParallelKLDiv` |
-| RKL custom autograd | `slime_plugins/opsd/distillation.py:_VocabParallelRKLDiv` |
+| Forward-KL custom autograd | `slime_plugins/opsd/distillation.py:VocabParallelKLDiv` |
+| RKL custom autograd | `slime_plugins/opsd/distillation.py:VocabParallelRKLDiv` |
 | Frozen-teacher swap | `slime_plugins/opsd/plugin.py:before_train_step_hook` |
 | Loss + metrics composition | `slime_plugins/opsd/plugin.py:loss_function` |
 
@@ -53,6 +53,7 @@ Source-of-truth files (read in this order):
 3. **Update `slime_plugins/opsd/README.md`** if any user-facing argument is added / removed / re-defaulted.
 4. **Update `slime/utils/arguments.py`** with matching defaults and help text. Keep the `argparse` help short; longer rationale goes into `ALGO.md`.
 5. **Run the diagnostic loop**: launch the 1.7B script for a few train steps, check `[opsd_dbg/mixture]` and `[opsd_dbg/sample]` stdout + `train/opsd_*` TB scalars match the health bands in `ALGO.md` Part 4.
+6. **Sweep the docs in the same commit**. If a rename, a removed flag, or an algorithm change landed, this file, `slime_plugins/opsd/README.md`, `BUG.md`, and any affected docstrings must reflect the new state in the same commit — not a follow-up.
 
 ### Soft rules
 
@@ -60,6 +61,14 @@ Source-of-truth files (read in this order):
 - Default values must be paper-aligned where paper specifies them; opt-in extensions never change defaults.
 - The mixture-weight `w_entropy` derivation in `mixture_weights` is sensitive to Python operator precedence — keep the explicit parens around the negation (`(-(w * log_w).sum(0)).clamp(min=0)`). Do NOT collapse to `-(w * log_w).sum(0).clamp(min=0)` — it parses as `-((w*log_w).sum(0).clamp(min=0))`, which clamps the negative sum to 0 then negates to -0.
 - Keep `[opsd_dbg/mixture]` and `[opsd_dbg/sample]` rank-0 diagnostic prints until the health-band monitoring is verified stable in production. Once removed, document the removal in this file.
+
+### Coding style
+
+- Prefer concise code. If a refactor adds layers (helper classes, wrapper functions, indirection) without a concrete reason, the original was right. Three straight lines beat three abstractions.
+- Do not use `getattr` / `hasattr` as a silent fallback for values that should always be present. Missing fields, mistyped flags, or unset configs are bugs — raise on them, don't paper over with a default.
+  - When the assumption is internal and a violation would be a programmer error, an `assert` is enough.
+  - When the assumption is on user-supplied data (CLI args, configs, batch contents), raise an exception with a message that names the field.
+  - For args registered in `slime/utils/arguments.py` with a default, read them directly (`args.opsd_xxx`) — the registered default already covers "not set". The only acceptable `getattr(obj, "x", default)` is when `x` is a genuinely optional knob *and* the default is the documented behavior.
 
 ---
 

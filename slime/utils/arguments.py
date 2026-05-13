@@ -1402,6 +1402,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--opsd-weight-top-k", type=int, default=512, help="Truncate vocab to top-K for mixture weights"
             )
             parser.add_argument(
+                "--opsd-kl-chunk",
+                type=int,
+                default=256,
+                help=(
+                    "Token-axis chunk size for the vocab-parallel KL/RKL ops and the "
+                    "q_mix accumulation. Smaller values cap peak per-chunk memory at "
+                    "the cost of more kernel launches; reduce (e.g. 128 or 64) when "
+                    "OPSD OOMs at large response_length × vocab_size, raise when there "
+                    "is GPU memory headroom and you want fewer launch-bound kernels."
+                ),
+            )
+            parser.add_argument(
                 "--opsd-jsd-token-clip",
                 type=float,
                 default=0.05,

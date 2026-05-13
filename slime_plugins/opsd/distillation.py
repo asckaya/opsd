@@ -30,6 +30,7 @@ def _is_rank0() -> bool:
         return True
     return dist.get_rank() == 0
 
+
 from slime.backends.megatron_utils.loss import get_responses
 
 from .selection import kcenter, pairwise_seq_jsd, pairwise_unigram_jsd
@@ -424,13 +425,25 @@ def mixture_weights(
             "diversity[mean=%.3f,max=%.3f,spread/t=%.3f] "
             "logits_spread/t=%.3f "
             "w_entropy_norm[mean=%.4f,max=%.4f,frac_nonzero=%.3f]",
-            N, T, args.opsd_temperature,
-            args.opsd_kl_weight, args.opsd_entropy_weight, args.opsd_diversity_weight,
-            d.mean().item(), d.max().item(), spread_d,
-            e.mean().item(), e.max().item(), spread_e,
-            g.mean().item(), g.max().item(), spread_g,
+            N,
+            T,
+            args.opsd_temperature,
+            args.opsd_kl_weight,
+            args.opsd_entropy_weight,
+            args.opsd_diversity_weight,
+            d.mean().item(),
+            d.max().item(),
+            spread_d,
+            e.mean().item(),
+            e.max().item(),
+            spread_e,
+            g.mean().item(),
+            g.max().item(),
+            spread_g,
             spread_lg,
-            wn.mean().item(), wn.max().item(), nz,
+            wn.mean().item(),
+            wn.max().item(),
+            nz,
         )
 
     return w, w_entropy_norm
@@ -463,35 +476,46 @@ def _pairwise_jsd(q_prob: torch.Tensor, q_log: torch.Tensor) -> torch.Tensor:
 # ── vocab-parallel KL divergence (§9) ───────────────────────────────────────
 
 
-class _VocabParallelKLDiv(torch.autograd.Function):
+def vocab_parallel_lse_chunk(c: torch.Tensor, tp_group) -> torch.Tensor:
+    """Numerically-stable distributed log-sum-exp over the last dim of ``c``.
+
+    Returns ``[c.shape[0], 1]``.  When ``tp_size == 1`` the all-reduces are
+    no-ops (skipped) so this collapses to a plain local LSE.
+    """
+    tp_size = dist.get_world_size(group=tp_group)
+    gmax = c.max(dim=-1, keepdim=True).values
+    if tp_size > 1:
+        dist.all_reduce(gmax, op=dist.ReduceOp.MAX, group=tp_group)
+    gsum = (c - gmax).exp().sum(dim=-1, keepdim=True)
+    if tp_size > 1:
+        dist.all_reduce(gsum, op=dist.ReduceOp.SUM, group=tp_group)
+    return gmax + gsum.log()
+
+
+class VocabParallelKLDiv(torch.autograd.Function):
     """Forward-KL(q_mix ‖ p_θ) for vocab-parallel student logits.
 
-    Each TP rank holds [T, V_local].  A two-phase chunked algorithm avoids
-    ever materialising [T, V_full] on any GPU:
+    Each TP rank holds [T, V_local].  Forward is a single chunked pass over
+    the token dim that interleaves the distributed LSE and the KL contribution
+    (no separate phase 1).  We never materialise [T, V_full] anywhere.
 
-    Phase 1 — distributed log-sum-exp:
-      Per chunk of token positions, each rank computes its local max and
-      exp-sum, all-reduces both, and writes the global lse into a [T]
-      buffer.  Peak extra GPU memory = [chunk, V_local] ≈ 38 MB (TP=4).
+    Backward: ``d(KL)/d(logit_u) = softmax_u − q_u`` (or, with clipping,
+    ``s · softmax_u − mask_u · q_u``).  Rather than save a [T, V_local]
+    grad buffer between forward and backward (~600 MB at TP=1 / V≈152k),
+    we save only the tiny inputs needed to recompute softmax on the fly:
 
-    Phase 2 — KL contribution + backward buffer:
-      Per chunk, log_softmax = logit_local - lse; KL local term is summed
-      and the difference (softmax_local - q_local) is stored in a pre-
-      allocated [T, V_local] buffer for the backward.  One all-reduce of
-      [T] (tiny) gives the global KL at the end.
+        ctx.save_for_backward(logit_local, q_local, lse, s_or_empty)
 
-    Backward: d(KL)/d(logit_local) = softmax_local - q_local.
-      Saved tensor is [T, V_local] ≈ 360 MB (TP=4), not [T, V_full].
+    ``logit_local`` is already pinned by Megatron's autograd saved activations
+    and ``q_local`` is already alive in the caller, so re-saving them is just
+    a Python reference — zero extra bytes.  ``lse`` and ``s_local`` are [T]
+    (≪ KB).  Cost is one extra chunked softmax pass during backward; loss
+    compute is dwarfed by the model fwd/bwd, so this is effectively free.
 
-    Per-(position, vocab-entry) pointwise KL clipping (paper §3.2 / Figure 4):
-      When `clip` is provided, each per-entry contribution
-          ℓ_{n,v} = q_v · (log q_v - log p_v)
-      is clipped to `clip` *before* the sum over v.  This down-weights
-      stylistic tokens whose individual KL contribution dominates the
-      sum.  The backward formula generalises to
-          d(KL_clip)/d(logit_u) = s · softmax_u - mask_u · q_u
-      where mask_v = [ℓ_{n,v} < clip] and s = Σ_v mask_v · q_v (per
-      position; requires a TP all-reduce when world_size > 1).
+    Per-(position, vocab-entry) KL clipping (paper §3.2 / Figure 4):
+      ℓ_{n,v} = q_v · (log q_v − log p_v) clipped to ``clip``.  Backward
+      becomes ``s · softmax_u − mask_u · q_u`` with ``mask = (ℓ < clip)``
+      and ``s = Σ_v mask_v · q_v`` (TP all-reduced).
     """
 
     @staticmethod
@@ -501,205 +525,128 @@ class _VocabParallelKLDiv(torch.autograd.Function):
         q_local: torch.Tensor,  # [T, V_local], detached q_mix shard
         tp_group,
         chunk_t: int,
-        clip: float | None,  # per-(pos, vocab) ℓ clipping threshold, or None
+        clip: float | None,
     ) -> torch.Tensor:  # [T]
-        T, V_local = logit_local.shape
+        T, _ = logit_local.shape
         tp_size = dist.get_world_size(group=tp_group)
         clip_enabled = clip is not None
 
-        # ── TP=1 fast path: no cross-rank reductions, single softmax per chunk ──
-        if tp_size == 1:
-            grad_buf = logit_local.new_empty(T, V_local)
-            kl = logit_local.new_zeros(T)
-            for t0 in range(0, T, chunk_t):
-                t1 = min(t0 + chunk_t, T)
-                lc = logit_local[t0:t1]  # view [c, V]
-                qc = q_local[t0:t1]
-                log_p = F.log_softmax(lc, dim=-1)  # [c, V]
-                per_entry = qc * (qc.clamp(min=1e-10).log() - log_p)  # [c, V]
-                sm_c = log_p.exp()
-                if clip_enabled:
-                    mask = per_entry < clip  # [c, V]
-                    per_entry = torch.where(mask, per_entry, per_entry.new_full((), clip))
-                    s = (mask.to(qc.dtype) * qc).sum(-1, keepdim=True)  # [c, 1]
-                    grad_buf[t0:t1] = sm_c * s - mask.to(qc.dtype) * qc
-                else:
-                    grad_buf[t0:t1] = sm_c - qc
-                kl[t0:t1] = per_entry.sum(-1)
-                del lc, qc, log_p, sm_c, per_entry
-            ctx.save_for_backward(grad_buf)
-            ctx.tp_group = tp_group
-            return kl
+        lse = logit_local.new_empty(T)
+        kl_local = logit_local.new_zeros(T)
+        s_local = logit_local.new_zeros(T) if clip_enabled else None
 
-        # ── TP > 1: chunked distributed log-sum-exp + KL ──
-        # Phase 1: distributed log-sum-exp
-        lse = logit_local.new_empty(T)  # [T]
         for t0 in range(0, T, chunk_t):
             t1 = min(t0 + chunk_t, T)
-            c = logit_local[t0:t1]  # view [c, V_local]
-            gmax = c.max(dim=-1, keepdim=True).values  # [c, 1] new tensor
-            dist.all_reduce(gmax, op=dist.ReduceOp.MAX, group=tp_group)
-            gsum = (c - gmax).exp().sum(dim=-1, keepdim=True)  # [c, 1]
-            dist.all_reduce(gsum, op=dist.ReduceOp.SUM, group=tp_group)
-            lse[t0:t1] = (gmax + gsum.log()).squeeze(-1)
-            del gmax, gsum
-
-        # Phase 2: KL + grad buffer.
-        # When clip is enabled we need the global Σ_v mask_v · q_v per position;
-        # accumulate local contributions then all-reduce a single [T] tensor at
-        # the end (per-position, per-rank: cheap).
-        grad_buf = logit_local.new_empty(T, V_local)  # [T, V_local]
-        kl_local = logit_local.new_zeros(T)  # [T]
-        s_local = logit_local.new_zeros(T) if clip_enabled else None  # [T]
-        for t0 in range(0, T, chunk_t):
-            t1 = min(t0 + chunk_t, T)
-            lc = logit_local[t0:t1]  # view [c, V_local]
-            qc = q_local[t0:t1]  # view [c, V_local]
-            log_p = lc - lse[t0:t1].unsqueeze(-1)  # log-softmax [c, V_local]
-            sm_c = log_p.exp()  # softmax [c, V_local]
-            per_entry = qc * (qc.clamp(min=1e-10).log() - log_p)  # [c, V_local]
+            lc = logit_local[t0:t1]
+            qc = q_local[t0:t1]
+            lse_chunk = vocab_parallel_lse_chunk(lc, tp_group)  # [c, 1]
+            lse[t0:t1] = lse_chunk.squeeze(-1)
+            log_p = lc - lse_chunk  # [c, V_local]
+            per_entry = qc * (qc.clamp(min=1e-10).log() - log_p)
             if clip_enabled:
-                assert s_local is not None  # for type checkers
+                assert s_local is not None
                 mask = per_entry < clip
                 per_entry = torch.where(mask, per_entry, per_entry.new_full((), clip))
-                mask_q = mask.to(qc.dtype) * qc  # [c, V_local]
-                s_local[t0:t1] = mask_q.sum(-1)
-                # grad placeholder: store -mask_q here; combine with s*softmax after all-reduce.
-                grad_buf[t0:t1] = -mask_q
-            else:
-                grad_buf[t0:t1] = sm_c - qc
+                s_local[t0:t1] = (mask.to(qc.dtype) * qc).sum(-1)
             kl_local[t0:t1] = per_entry.sum(-1)
-            del log_p, sm_c, per_entry
-        del lse
 
-        # Sum KL shards across TP ranks (one all-reduce of [T]).
-        kl = kl_local.clone()
-        dist.all_reduce(kl, op=dist.ReduceOp.SUM, group=tp_group)
+        if tp_size > 1:
+            dist.all_reduce(kl_local, op=dist.ReduceOp.SUM, group=tp_group)
+            if clip_enabled:
+                assert s_local is not None
+                dist.all_reduce(s_local, op=dist.ReduceOp.SUM, group=tp_group)
 
-        if clip_enabled:
-            assert s_local is not None  # for type checkers
-            # Reduce s to global, then materialise the actual grad buffer.
-            dist.all_reduce(s_local, op=dist.ReduceOp.SUM, group=tp_group)
-            # Rewrite grad_buf in-place: grad = softmax_local * s + (-mask_q already there).
-            # We need softmax_local again; recompute from logit - global_lse cached as
-            # logit_local - (logit_local - log_softmax). Cheaper to recompute lse once
-            # over all T (T is at most a few k, full softmax cost dominated by other paths).
-            # Use the lse we discarded above: re-derive lazily per chunk.
-            # NOTE: this recomputes log_softmax once; the alternative is to save [T, V_local]
-            # of softmax which doubles the saved-for-backward footprint.
-            # Recompute lse (same chunked formula as Phase 1 above, no new comms because
-            # we re-all_reduce gmax/gsum — order N(T) flops, negligible vs the V loop).
-            lse2 = logit_local.new_empty(T)
-            for t0 in range(0, T, chunk_t):
-                t1 = min(t0 + chunk_t, T)
-                c = logit_local[t0:t1]
-                gmax = c.max(dim=-1, keepdim=True).values
-                dist.all_reduce(gmax, op=dist.ReduceOp.MAX, group=tp_group)
-                gsum = (c - gmax).exp().sum(dim=-1, keepdim=True)
-                dist.all_reduce(gsum, op=dist.ReduceOp.SUM, group=tp_group)
-                lse2[t0:t1] = (gmax + gsum.log()).squeeze(-1)
-                del gmax, gsum
-            for t0 in range(0, T, chunk_t):
-                t1 = min(t0 + chunk_t, T)
-                sm_c = (logit_local[t0:t1] - lse2[t0:t1].unsqueeze(-1)).exp()
-                # grad_buf currently holds -mask_q; add softmax * s.
-                grad_buf[t0:t1].add_(sm_c * s_local[t0:t1].unsqueeze(-1))
-                del sm_c
-            del lse2
-
-        ctx.save_for_backward(grad_buf)
-        ctx.tp_group = tp_group
-        return kl
+        # save_for_backward requires tensors; use an empty tensor as the "no s" sentinel.
+        ctx.save_for_backward(logit_local, q_local, lse, s_local if clip_enabled else logit_local.new_empty(0))
+        ctx.chunk_t = chunk_t
+        ctx.clip_enabled = clip_enabled
+        ctx.clip = clip
+        return kl_local
 
     @staticmethod
     def backward(ctx, grad_kl: torch.Tensor):
-        (grad_buf,) = ctx.saved_tensors
-        # Unclipped: grad_buf = softmax_local - q_local.
-        # Clipped:   grad_buf = softmax_local * s - mask * q_local.
-        grad = grad_kl.unsqueeze(-1) * grad_buf  # [T, V_local]
+        logit_local, q_local, lse, s_local = ctx.saved_tensors
+        chunk_t = ctx.chunk_t
+        clip_enabled = ctx.clip_enabled
+        T, _ = logit_local.shape
+
+        grad = torch.empty_like(logit_local)
+        for t0 in range(0, T, chunk_t):
+            t1 = min(t0 + chunk_t, T)
+            qc = q_local[t0:t1]
+            sm_c = (logit_local[t0:t1] - lse[t0:t1].unsqueeze(-1)).exp()
+            scale = grad_kl[t0:t1].unsqueeze(-1)
+            if clip_enabled:
+                # mask depends on log p, which we don't save (just lse) — recompute.
+                log_p = logit_local[t0:t1] - lse[t0:t1].unsqueeze(-1)
+                per_entry = qc * (qc.clamp(min=1e-10).log() - log_p)
+                mask_q = (per_entry < ctx.clip).to(qc.dtype) * qc
+                grad[t0:t1] = scale * (sm_c * s_local[t0:t1].unsqueeze(-1) - mask_q)
+            else:
+                grad[t0:t1] = scale * (sm_c - qc)
         return grad, None, None, None, None
 
 
-class _VocabParallelRKLDiv(torch.autograd.Function):
+class VocabParallelRKLDiv(torch.autograd.Function):
     """Reverse-KL: KL(p_θ ‖ q_mix), vocab-parallel.
 
-    Per position n: ``L_n = Σ_v p_v (log p_v − log q_v)``.  Used as ALGO.md Part 1
-    §9's optional auxiliary term `L_RKL` (with ``α << 1``).  The full forward-KL
-    above remains the dominant signal; this op exists so users who want the
-    auxiliary can opt in via ``--opsd-rkl-weight > 0``.
+    Same forward/backward shape as ``VocabParallelKLDiv`` (single chunked
+    forward, recompute-in-backward).  Used as ALGO.md Part 1 §9's optional
+    auxiliary term ``L_RKL`` (with ``α << 1``).
 
-    Closed-form gradient w.r.t. ``logit_u`` (derived from softmax + chain rule):
-
+    Per position n:
+        L_n = Σ_v p_v (log p_v − log q_v)
         d L_n / d(logit_u) = p_u · ((log p_u − log q_u) − L_n)
 
-    With TP > 1 we still need the *global* ``L_n`` for the formula, so the
-    Phase-2 KL all-reduce stays mandatory even when clipping is off.
+    Saved-for-backward: ``(logit_local, q_local, lse, kl)`` — all tiny or
+    pre-existing.  Replaces the old ``p_buf`` + ``log_p_minus_log_q_p`` pair
+    (~1.2 GB persistent at TP=1 / V≈152k).
     """
 
     @staticmethod
     def forward(
         ctx,
-        logit_local: torch.Tensor,  # [T, V_local], requires_grad
-        q_local: torch.Tensor,  # [T, V_local], detached q_mix shard
+        logit_local: torch.Tensor,
+        q_local: torch.Tensor,
         tp_group,
         chunk_t: int,
-    ) -> torch.Tensor:  # [T]
-        T, V_local = logit_local.shape
+    ) -> torch.Tensor:
+        T, _ = logit_local.shape
         tp_size = dist.get_world_size(group=tp_group)
 
-        # Phase 1: distributed log-sum-exp (re-used to form log p locally).
-        if tp_size == 1:
-            log_p_chunks_lse = None  # mark "no LSE needed"
-        else:
-            lse = logit_local.new_empty(T)
-            for t0 in range(0, T, chunk_t):
-                t1 = min(t0 + chunk_t, T)
-                c = logit_local[t0:t1]
-                gmax = c.max(dim=-1, keepdim=True).values
-                dist.all_reduce(gmax, op=dist.ReduceOp.MAX, group=tp_group)
-                gsum = (c - gmax).exp().sum(dim=-1, keepdim=True)
-                dist.all_reduce(gsum, op=dist.ReduceOp.SUM, group=tp_group)
-                lse[t0:t1] = (gmax + gsum.log()).squeeze(-1)
-                del gmax, gsum
-            log_p_chunks_lse = lse
-
-        # Phase 2: per-chunk RKL contributions and grad-buf scaffolding.
+        lse = logit_local.new_empty(T)
         kl_local = logit_local.new_zeros(T)
-        log_p_minus_log_q_p = logit_local.new_empty(T, V_local)  # holds p_v·(log p_v − log q_v)
-        p_buf = logit_local.new_empty(T, V_local)  # holds p_v
+
         for t0 in range(0, T, chunk_t):
             t1 = min(t0 + chunk_t, T)
             lc = logit_local[t0:t1]
             qc = q_local[t0:t1].clamp(min=1e-10)
-            if tp_size == 1:
-                log_p = F.log_softmax(lc, dim=-1)
-            else:
-                assert log_p_chunks_lse is not None
-                log_p = lc - log_p_chunks_lse[t0:t1].unsqueeze(-1)
+            lse_chunk = vocab_parallel_lse_chunk(lc, tp_group)
+            lse[t0:t1] = lse_chunk.squeeze(-1)
+            log_p = lc - lse_chunk
             p = log_p.exp()
-            term = p * (log_p - qc.log())
-            kl_local[t0:t1] = term.sum(-1)
-            log_p_minus_log_q_p[t0:t1] = term  # save for backward
-            p_buf[t0:t1] = p
-            del log_p, p, term
+            kl_local[t0:t1] = (p * (log_p - qc.log())).sum(-1)
 
         if tp_size > 1:
-            kl = kl_local.clone()
-            dist.all_reduce(kl, op=dist.ReduceOp.SUM, group=tp_group)
-        else:
-            kl = kl_local
+            dist.all_reduce(kl_local, op=dist.ReduceOp.SUM, group=tp_group)
 
-        ctx.save_for_backward(p_buf, log_p_minus_log_q_p, kl)
-        ctx.tp_group = tp_group
-        return kl
+        ctx.save_for_backward(logit_local, q_local, lse, kl_local)
+        ctx.chunk_t = chunk_t
+        return kl_local
 
     @staticmethod
     def backward(ctx, grad_kl: torch.Tensor):
-        p_buf, log_p_minus_log_q_p, kl = ctx.saved_tensors
-        # d L_n / d(logit_u) = p_u · ((log p_u − log q_u) − L_n)
-        #                    = (p_u · (log p_u − log q_u)) − p_u · L_n
-        grad_local = log_p_minus_log_q_p - p_buf * kl.unsqueeze(-1)
-        grad = grad_kl.unsqueeze(-1) * grad_local
+        logit_local, q_local, lse, kl = ctx.saved_tensors
+        chunk_t = ctx.chunk_t
+        T, _ = logit_local.shape
+
+        grad = torch.empty_like(logit_local)
+        for t0 in range(0, T, chunk_t):
+            t1 = min(t0 + chunk_t, T)
+            qc = q_local[t0:t1].clamp(min=1e-10)
+            log_p = logit_local[t0:t1] - lse[t0:t1].unsqueeze(-1)
+            p = log_p.exp()
+            grad[t0:t1] = grad_kl[t0:t1].unsqueeze(-1) * p * (log_p - qc.log() - kl[t0:t1].unsqueeze(-1))
         return grad, None, None, None
 
 
@@ -834,13 +781,13 @@ def distillation_loss(
     """
     from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_model_parallel_rank
 
-    _CHUNK_T = 256
+    chunk_t = args.opsd_kl_chunk
     tp_rank = get_tensor_model_parallel_rank()
     tp_group = get_tensor_model_parallel_group()
 
     device = student_logits[0].device
     per_token_kl: list[torch.Tensor] = []
-    rkl_enabled = getattr(args, "opsd_rkl_weight", 0.0) > 0.0
+    rkl_enabled = args.opsd_rkl_weight > 0.0
     per_token_rkl: list[torch.Tensor] | None = [] if rkl_enabled else None
     w_entropy_sum = torch.tensor(0.0, device=device)
     w_entropy_count = 0
@@ -883,13 +830,18 @@ def distillation_loss(
         w, w_entropy_norm = mixture_weights(args, p_student, q_gathered, weight_idx)
         del q_gathered, weight_idx
 
-        # §8 — q_mix for this TP rank's vocab shard [T, V_local].
+        # §8 — q_mix for this TP rank's vocab shard [T, V_local].  Accumulate in
+        # fp32 for numerical safety (small N weighted softmaxes summing to 1),
+        # then cast to p_student.dtype before passing into KL so every chunk-loop
+        # temporary inside KL/RKL stays bf16 instead of upcasting to fp32 — at
+        # TP=1 / V≈152k / chunk=256 that's the difference between a ~78 MiB and
+        # ~155 MiB temp, and the latter was triggering recurring OOMs.
         q_mix_local = torch.zeros(T, V_local, dtype=torch.float32, device=device)
         for k, ltsr in enumerate(sel_src):
             l_gpu = ltsr.to(device, non_blocking=True)
             w_k = w[k]
-            for t0 in range(0, T, _CHUNK_T):
-                t1 = min(t0 + _CHUNK_T, T)
+            for t0 in range(0, T, chunk_t):
+                t1 = min(t0 + chunk_t, T)
                 s_full = F.softmax(l_gpu[t0:t1], dim=-1)
                 s_local = s_full[:, shard_start : shard_start + V_local]
                 s_local = s_local * w_k[t0:t1].unsqueeze(-1)
@@ -897,11 +849,10 @@ def distillation_loss(
                 del s_full, s_local
             del l_gpu
         del sel_src, w
+        q_mix_local = q_mix_local.to(p_student.dtype)
 
         # §9 — KL(q_mix ‖ p_θ) via vocab-parallel custom autograd.
-        kl = _VocabParallelKLDiv.apply(
-            p_student, q_mix_local.detach(), tp_group, _CHUNK_T, args.opsd_pointwise_kl_clip
-        )
+        kl = VocabParallelKLDiv.apply(p_student, q_mix_local.detach(), tp_group, chunk_t, args.opsd_pointwise_kl_clip)
 
         if args.opsd_jsd_token_clip is not None:
             kl = kl.clamp(max=args.opsd_jsd_token_clip)
@@ -913,7 +864,7 @@ def distillation_loss(
         # (α << 1 in ALGO.md Part 1 §9), so this is composed in plugin.py rather
         # than added here.
         if per_token_rkl is not None:
-            rkl = _VocabParallelRKLDiv.apply(p_student, q_mix_local.detach(), tp_group, _CHUNK_T)
+            rkl = VocabParallelRKLDiv.apply(p_student, q_mix_local.detach(), tp_group, chunk_t)
             per_token_rkl.append(rkl)
 
         del q_mix_local
@@ -954,7 +905,7 @@ def distillation_loss(
 
 def extract_student_responses(logits: torch.Tensor, args, batch: dict) -> list[torch.Tensor]:
     # Student logits stay vocab-parallel [T, V_local]; distillation_loss and
-    # _VocabParallelKLDiv are designed to operate on them without gathering.
+    # VocabParallelKLDiv are designed to operate on them without gathering.
     return [
         chunk
         for chunk, _ in get_responses(
