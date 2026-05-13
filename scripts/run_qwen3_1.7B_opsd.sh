@@ -62,29 +62,48 @@ ROLLOUT_ARGS=(
 
 # OPSD Plugin Arguments
 OPSD_ARGS=(
-   # Function paths (pointing to the __init__.py entry points)
+   # ── Function paths ─────────────────────────────────────────────────
    --rollout-function-path slime_plugins.opsd.generate_rollout
    --custom-megatron-init-path slime_plugins.opsd.init_hook
    --custom-megatron-before-train-step-hook-path slime_plugins.opsd.before_train_step_hook
    --loss-type custom_loss
    --custom-loss-function-path slime_plugins.opsd.loss_function
 
-   # OPSD Hyperparameters — tuned for throughput while staying inside
-   # method.md §13 recommendations (K=8-32, N=2-4, K_b=8-16).
-   --opsd-k 16                # Privileged pool size (K). Rollout total = K+1 = 17 (1 student + 16 candidates)
-   --opsd-n 4                 # Select 4 diverse traces (N) — method.md recommends 2-4
-   --opsd-kb 8                # Pre-filter top 8 by quality (K_b) — halves q_forwards vs K_b=16
-   --opsd-alpha 1.0           # L_distill weight (method.md §9). No GRPO baggage by default.
-   --opsd-kl-weight 1.0       # Mixture weight KL coeff (beta)
-   --opsd-entropy-weight 0.5  # Mixture weight Entropy coeff (gamma)
-   --opsd-diversity-weight 0.5 # Mixture weight Diversity coeff (rho)
-   --opsd-weight-top-k 512    # Efficiency: truncate vocab for weights
-   # --opsd-diversity-metric defaults to token_jsd (method.md §5 "recommended").
-   # If wall-clock matters more than fidelity, pass `--opsd-diversity-metric unigram_jsd`
-   # to do selection BEFORE the q-forward and save (K_b - N) q_forwards per sample.
-   --opsd-diversity-top-k 128 # Top-K vocab truncation for token-level JSD
-   # --opsd-pointwise-kl-clip defaults to 0.05 (paper §3.2 / Figure 4 — official
-   # OPSD scripts ship with --jsd_token_clip 0.05; required for >50-step runs).
+   # ── Pool / selection sizes (ALGO §1.3 recommends K=8-32, N=2-4, K_b=8-16) ─
+   --opsd-k 16                          # K (default 8). Total rollouts/prompt = K+1 = 17 (1 student + K candidates)
+   --opsd-n 4                           # N selected diverse traces (default 2)
+   --opsd-kb 8                          # TopK_b pre-filter on quality score (default off ⇒ keep all K)
+   --opsd-fallback-to-gt                # default; flip to --no-opsd-fallback-to-gt to drop prompts with no correct candidate
+
+   # ── Loss composition ───────────────────────────────────────────────
+   --opsd-alpha 1.0                     # scale on L_distill; ALGO §1.1 step 8 default
+   --opsd-rkl-weight 0.0                # off; >0 adds α_RKL·KL(p_θ‖q_mix), paper recommends α_RKL ≪ 1 (e.g. 0.01)
+   # --opsd-mix-with-policy-loss        # opt-in ablation: layer GRPO PG-loss on top of L_distill
+   --opsd-jsd-token-clip 0.05           # per-position KL clamp post sum-over-vocab; matches paper's --jsd_token_clip 0.05
+   # --opsd-pointwise-kl-clip 0.05      # opt-in: per-(pos,vocab) one-sided clip. CAN drive per-token KL negative — prefer the line above
+
+   # ── Mixture weights (ALGO §1.1 step 6) ─────────────────────────────
+   --opsd-kl-weight 1.0                 # β (KL coefficient)
+   --opsd-entropy-weight 0.5            # γ (entropy coefficient)
+   --opsd-diversity-weight 0.5          # ρ (diversity coefficient)
+   --opsd-temperature 1.0               # 1.0 ⇒ raw distributions; ALGO has no temperature term
+   --opsd-weight-top-k 512              # top-K vocab truncation for the mixture-weight softmax
+
+   # ── Quality scoring (ALGO §1.1 step 3) ─────────────────────────────
+   --opsd-quality-len-weight 0.1        # η_l (length penalty)
+   --opsd-quality-format-weight 0.2     # η_f (format penalty)
+   --opsd-quality-conf-weight 0.5       # η_c (Conf reward)
+   --opsd-quality-conf-norm rank        # rank → [0,1]; puts η_c on the same axis as Len/Format. Alts: zscore | minmax | raw
+
+   # ── Diversity selection (ALGO §1.1 step 4) ─────────────────────────
+   --opsd-diversity-metric token_jsd    # k-center greedy distance. Alt: unigram_jsd → selects BEFORE q-forward, saves (K_b - N) q-forwards/sample
+   --opsd-diversity-top-k 128           # top-K vocab truncation for token-JSD
+
+   # ── Teacher snapshot ───────────────────────────────────────────────
+   --opsd-freeze-teacher                # default; flip to --no-opsd-freeze-teacher for legacy "teacher = current student" mode
+
+   # ── Memory knob (lower → safer; raise on small V/T to reduce launch overhead) ─
+   --opsd-kl-chunk 256                  # token-axis chunk for the vocab-parallel KL/RKL forward+backward
 )
 
 # Performance & Parallelism

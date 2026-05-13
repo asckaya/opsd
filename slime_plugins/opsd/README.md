@@ -3,10 +3,10 @@
 On-policy self-distillation (OPSD): the student's own successful reasoning traces
 serve as privileged information for token-level mixture-teacher distillation.
 By default the teacher is a **frozen snapshot of the initial actor weights**
-(paper §4.1), so no separate teacher checkpoint is required.
+so no separate teacher checkpoint is required.
 
 The training loss is **pure full-vocabulary forward-KL distillation**
-(paper Eq. 8 / `ALGO.md` §1.1-step-8). No PPO/GRPO policy-gradient signal is
+(`ALGO.md` Part 1 §1.1 step 8). No PPO/GRPO policy-gradient signal is
 mixed in by default — pass `--opsd-mix-with-policy-loss` to ablate the legacy
 hybrid.
 
@@ -16,7 +16,7 @@ hybrid.
 2. **Filter**: Keep correct traces `B_x = {τ | R(x, τ) = 1}`.
 3. **Quality score**: `s(τ) = 1 - η_l·len/L - η_f·format + η_c·conf`.
    `conf = (1/|τ|) Σ_t log π_T(τ_t | x, τ_<t)` from a dedicated forward over
-   `chat(x) + τ_k` (`ALGO.md` §1.1-step-3).
+   `chat(x) + τ_k`.
 4. **TopK_b**: Retain top-K_b candidates by full quality score, applied *before*
    the q-teacher forward so discarded candidates are not run through the
    expensive q-forward.
@@ -26,7 +26,7 @@ hybrid.
 7. **Weights**: `w_k^t ∝ exp(-β·Δ_k^t - γ·h_k^t + ρ·g_k^t)`.
 8. **Distill**: `L = α · KL(Σ_k w_k^t q_k^t ‖ p_θ^t)`. With
    `--opsd-rkl-weight α_RKL > 0`, an aux `α_RKL · KL(p_θ ‖ q_mix)` is added
-   (`ALGO.md` §1.1-step-8; the paper recommends `α_RKL ≪ 1`).
+   (paper recommends `α_RKL ≪ 1`).
 
 ## Frozen-teacher mechanism
 
@@ -82,8 +82,8 @@ legacy behavior of running teacher forwards against the current student weights.
 - With `--opsd-diversity-metric unigram_jsd` (token-only distance), the
   diversity selection happens BEFORE the q-forward and q-forward runs only on
   the N selected traces — saving (K_b - N) full q-forwards per sample.
-  `ALGO.md` §1.1-step-4 recommends token_jsd (the default); switch to
-  unigram_jsd if q-forward cost dominates wall-clock and you can tolerate the
+  Token-JSD is the default and the recommended diversity metric; switch to
+  unigram-JSD if q-forward cost dominates wall-clock and you can tolerate the
   approximation.
 - q_mix is built with GPU-side softmax over the full vocab (peak GPU delta
   ≈ [chunk, V_full] float32 ≈ 150 MB at chunk=256, V=152k).
@@ -110,11 +110,49 @@ See `scripts/run_qwen3_1.7B_opsd.sh` for a complete example.
 --custom-loss-function-path slime_plugins.opsd.loss_function
 ```
 
+## Project conventions (where the algorithm spec is silent)
+
+| Convention | Where | Why |
+|---|---|---|
+| Conf rank-normalized across a sample's candidates | `distillation.py:add_conf` | The spec only gives `Conf = mean log-prob`, no numerical scaling. Raw Conf in [-5,-1] nats overwhelms Len/Format ([0,1] axis), making the default `η_c=0.5` meaningless. `rank → [0,1]` puts the three terms on the same scale. `--opsd-quality-conf-norm raw` restores literal behavior. |
+| Top-K=512 vocab approximation for mixture weights | `distillation.py:mixture_weights` | Full-vocab at `N=4 / T=8k` blows GPU memory. The spec doesn't constrain this; it's a pure engineering knob (`--opsd-weight-top-k`). |
+| GT-fallback when all candidates are wrong | `rollout.py:_collect_privileged` | Spec says "fallback to GT" but is silent on format; we encode the label as a single trace and proceed normally. |
+
+## Opt-in extensions vs paper defaults
+
+All non-paper behavior is opt-in; default values match paper Table 6 where it
+specifies, and `ALGO.md` Part 1 elsewhere.
+
+| Extension | Trigger | Default |
+|---|---|---|
+| Hybrid distillation + GRPO PG | `--opsd-mix-with-policy-loss` | False (paper is replacement, not addition) |
+| Reverse-KL aux term | `--opsd-rkl-weight <α_RKL>` | 0.0 (off) |
+| Mixture-weight temperature softening | `--opsd-temperature <T>` | 1.0 (raw) |
+| Per-(pos, vocab) KL clip (one-sided; sum-over-vocab can go negative) | `--opsd-pointwise-kl-clip <τ>` | None (off) |
+| Cheaper diversity via `unigram_jsd` (selects before q-forward) | `--opsd-diversity-metric unigram_jsd` | `token_jsd` |
+| Conf normalization mode | `--opsd-quality-conf-norm rank/zscore/minmax/raw` | `rank` |
+| Top-K vocab approximation (mixture / JSD) | `--opsd-weight-top-k` / `--opsd-diversity-top-k` | 512 / 128 |
+| Frozen-teacher off (student doubles as teacher) | `--no-opsd-freeze-teacher` | True |
+| External teacher (= regular KD, no longer OPSD) | `--no-opsd-freeze-teacher --use-opd --opd-type megatron --opd-teacher-load <path>` | off |
+
+### Relation to slime's built-in `--use-opd`
+
+slime's `--use-opd / --opd-kl-coef` implements paper's alternative objective
+(Eq. 9) — a sampled-token PG correction where `reverse_kl = log π_S − log π_T`
+plays the role of an advantage modifier in `apply_opd_kl_to_advantages`. That
+is a *different* objective from this plugin's main loss:
+
+- slime `--use-opd`: single teacher, sampled-token PG, one scalar signal per token.
+- this plugin: N-teacher mixture, **full-vocab** forward-KL, dense per-token signal.
+
+Teacher-loading infrastructure is shared (same `"teacher"` weight tag); the
+semantic boundary is `--opsd-freeze-teacher`.
+
 ## Hyperparameters
 
 Defaults align with **`ALGO.md` Part 1** (the project's algorithm spec).
 Where it is silent, defaults fall back to paper Table 6 (OPSD column, also
-in `ALGO.md` §1.2 / Part 5). Project-specific extensions (rank-normalized
+in `ALGO.md` §1.2 / Part 2). Project-specific extensions (rank-normalized
 Conf, unigram-JSD diversity, hybrid GRPO+OPSD loss, RKL aux) are opt-in.
 
 | Argument | Default | Description |
@@ -122,24 +160,25 @@ Conf, unigram-JSD diversity, hybrid GRPO+OPSD loss, RKL aux) are opt-in.
 | `--opsd-k` | `8` | Privileged-pool size per prompt (K) — `ALGO.md` §1.3 range 8–32. Total rollouts per prompt = K+1 (1 student + K candidates) |
 | `--opsd-n` | `2` | Diverse traces to select (N) — `ALGO.md` §1.3 range 2–4 |
 | `--opsd-kb` | — | Pre-filter top-K_b by quality (`ALGO.md` §1.3 range 8–16) |
-| `--opsd-alpha` | `1.0` | Scale on L_distill (`ALGO.md` §1.1-step-8). Default loss is α·L_distill |
-| `--opsd-rkl-weight` | `0.0` | Optional reverse-KL aux weight (`ALGO.md` §1.1-step-8: α_RKL ≪ 1). 0 disables |
+| `--opsd-alpha` | `1.0` | Scale on L_distill. Default loss is α·L_distill |
+| `--opsd-rkl-weight` | `0.0` | Optional reverse-KL aux weight (α_RKL ≪ 1). 0 disables |
 | `--opsd-mix-with-policy-loss` | `False` | Opt-in ablation: add the GRPO PG-loss on top of L_distill |
 | `--opsd-kl-weight` | `1.0` | Mixture weight β (KL term) |
 | `--opsd-entropy-weight` | `0.5` | Mixture weight γ (entropy term) |
 | `--opsd-diversity-weight` | `0.5` | Mixture weight ρ (diversity term) |
 | `--opsd-temperature` | `1.0` | Softening for mixture-weight computation only; does NOT affect the final KL |
 | `--opsd-weight-top-k` | `512` | Vocab truncation for weight computation |
-| `--opsd-jsd-token-clip` | `0.05` | Per-position KL clamp post sum-over-vocab (paper §3.2 / Figure 4 — matches official OPSD scripts' `--jsd_token_clip 0.05`). Pass `<= 0` to disable |
+| `--opsd-jsd-token-clip` | `0.05` | Per-position KL clamp post sum-over-vocab (matches official OPSD scripts' `--jsd_token_clip 0.05`). Pass `<= 0` to disable |
 | `--opsd-pointwise-kl-clip` | — | Per-(position, vocab-entry) ℓ_{n,v} one-sided cap. NOTE: one-sided clip can drive per-token KL negative when student diverges; prefer `--opsd-jsd-token-clip`. Pass `<= 0` to disable |
 | `--opsd-fallback-to-gt` | `True` | Use GT trace when B_x is empty |
 | `--opsd-quality-len-weight` | `0.1` | η_l: length penalty |
 | `--opsd-quality-format-weight` | `0.2` | η_f: format penalty |
 | `--opsd-quality-conf-weight` | `0.5` | η_c: confidence weight |
-| `--opsd-quality-conf-norm` | `rank` | Normalize Conf across a sample's candidates so η_c lives on the same [0,1] axis as the structural terms (`ALGO.md` §1.1-step-3 is silent on Conf's scale; default `η_c=0.5` only makes sense with normalization). Modes: `rank` / `zscore` / `minmax` / `raw` (literal mean log-prob) |
-| `--opsd-diversity-metric` | `token_jsd` | `token_jsd` (`ALGO.md` §1.1-step-4 recommended) or `unigram_jsd` (cheap approximation) |
+| `--opsd-quality-conf-norm` | `rank` | Normalize Conf across a sample's candidates so η_c lives on the same [0,1] axis as the structural terms. Modes: `rank` / `zscore` / `minmax` / `raw` (literal mean log-prob) |
+| `--opsd-diversity-metric` | `token_jsd` | `token_jsd` (recommended) or `unigram_jsd` (cheap approximation) |
 | `--opsd-diversity-top-k` | `128` | Vocab truncation for token-JSD diversity |
-| `--opsd-freeze-teacher` | `True` | Use frozen initial-policy snapshot as the teacher (paper §4.1). Disable with `--no-opsd-freeze-teacher` |
+| `--opsd-kl-chunk` | `256` | Token-dim chunk for the vocab-parallel KL/RKL forward+backward. Lower if you see OOMs; raise if compute-bound on small vocab |
+| `--opsd-freeze-teacher` | `True` | Use frozen initial-policy snapshot as the teacher. Disable with `--no-opsd-freeze-teacher` |
 
 ## External teacher (not OPSD, but supported)
 

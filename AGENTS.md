@@ -2,11 +2,11 @@
 
 Source-of-truth files (read in this order):
 
-1. `ALGO.md` — Algorithm spec (Part 1), implementation status (Part 2), opt-in knobs (Part 3), monitoring (Part 4), paper REF excerpts (Part 5).
-2. `slime_plugins/opsd/README.md` — User-facing argument table; must stay in sync with `slime/utils/arguments.py`.
-3. `CLAUDE.md` / `AGENTS.md` — Top-level project instructions (one is a symlink to the other).
+1. `ALGO.md` — Algorithm spec (Part 1) + paper REF excerpts (Part 2).
+2. `slime_plugins/opsd/README.md` — User-facing argument table, project conventions, opt-in extensions; must stay in sync with `slime/utils/arguments.py`.
+3. `CLAUDE.md` / `AGENTS.md` — Top-level project instructions (one is a symlink to the other), including health-monitoring tables.
 
-`ALGO.md` Part 1 ⊇ paper: paper is the project algorithm at `N=1` with `τ_k = y*` (ground truth). When in doubt, prefer Part 1 semantics; prefer Part 5 numerics for paper-faithful hyperparameters.
+`ALGO.md` Part 1 ⊇ paper: paper is the project algorithm at `N=1` with `τ_k = y*` (ground truth). When in doubt, prefer Part 1 semantics; prefer Part 2 numerics for paper-faithful hyperparameters.
 
 ---
 
@@ -49,11 +49,11 @@ Source-of-truth files (read in this order):
 ## When changing OPSD behavior
 
 1. **Read `ALGO.md` Part 1 first**. Verify your change is consistent with the algorithmic contract; if it isn't, the change must land as an opt-in knob, not a default change.
-2. **Update `ALGO.md`** if the algorithmic contract or opt-in surface changes (Part 1 for spec, Part 2 for impl alignment, Part 3 for opt-in surface, Part 5 for paper REF).
-3. **Update `slime_plugins/opsd/README.md`** if any user-facing argument is added / removed / re-defaulted.
-4. **Update `slime/utils/arguments.py`** with matching defaults and help text. Keep the `argparse` help short; longer rationale goes into `ALGO.md`.
-5. **Run the diagnostic loop**: launch the 1.7B script for a few train steps, check `[opsd_dbg/mixture]` and `[opsd_dbg/sample]` stdout + `train/opsd_*` TB scalars match the health bands in `ALGO.md` Part 4.
-6. **Sweep the docs in the same commit**. If a rename, a removed flag, or an algorithm change landed, this file, `slime_plugins/opsd/README.md`, `BUG.md`, and any affected docstrings must reflect the new state in the same commit — not a follow-up.
+2. **Update `ALGO.md`** if the algorithmic contract changes (Part 1 for spec, Part 2 for paper REF).
+3. **Update `slime_plugins/opsd/README.md`** if any user-facing argument, project convention, or opt-in extension is added / removed / re-defaulted.
+4. **Update `slime/utils/arguments.py`** with matching defaults and help text. Keep the `argparse` help short; longer rationale goes into the README's project-conventions or opt-in tables.
+5. **Run the diagnostic loop**: launch the 1.7B script for a few train steps, check `[opsd_dbg/mixture]` and `[opsd_dbg/sample]` stdout + `train/opsd_*` TB scalars match the health bands below.
+6. **Sweep the docs in the same commit**. If a rename, a removed flag, or an algorithm change landed, this file, `slime_plugins/opsd/README.md`, `ALGO.md`, `BUG.md`, and any affected docstrings must reflect the new state in the same commit — not a follow-up.
 
 ### Soft rules
 
@@ -82,6 +82,21 @@ Source-of-truth files (read in this order):
 | Generations per prompt | `1` | `K+1=17` (1 student + K=16 candidates) | project mixture extension (`ALGO.md` §1.1); paper is N=1 special case |
 | Sampling temperature | `1.1` | `1.1` | — |
 | Top-p / Top-k | (not stated) | `0.95 / 20` | OPSD official training scripts |
-| KL clip τ | `0.05` (paper §3.2 / Fig.4) | `--opsd-jsd-token-clip 0.05` | — |
+| KL clip τ | `0.05` | `--opsd-jsd-token-clip 0.05` | — |
 | LoRA r/α | `64 / 128` | full fine-tune | slime Megatron path doesn't run LoRA |
 | Training steps | `100` | `--num-rollout 1000` (longer schedule) | longer-horizon experiments |
+
+---
+
+## Health monitoring (TB / stdout quick lookup)
+
+| Metric | Healthy range | Anomaly meaning |
+|---|---|---|
+| `rollout/raw_reward` | 0.3–0.9 | Too low → student weak / data too hard / truncated; too high → group all-correct, mixture loses diversity |
+| `rollout/truncated_ratio` | < 0.1 | High → `--rollout-max-response-len` too small for the CoT length |
+| `rollout/zero_std/count_0+count_1` | < `rollout-batch-size` | == batch ⇒ every group has std=0, OPSD input degenerate |
+| `train/opsd_kl` | ≥ 0, drifting to a stable value | Negative → almost certainly `--opsd-pointwise-kl-clip` accidentally on (one-sided); switch back to `--opsd-jsd-token-clip` |
+| `train/opsd_kl_clamped` | == `opsd_kl` | Diverging from `opsd_kl` mirrors the row above |
+| `train/opsd_w_entropy` | 0.3–0.8 | 0 → mixture one-hot; 1 → fully uniform; adjust `--opsd-kl-weight` ±2× |
+| `train/lr-pg_0/1` | == `--lr` | Reads from `param_group["lr"]`; if 0, the scheduler never wrote lr in |
+| `train/grad_norm` | 0.1–1.0 | Too large → KL clip ineffective or RKL too strong; too small → weak training signal |
