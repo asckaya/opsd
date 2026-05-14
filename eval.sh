@@ -20,7 +20,7 @@
 set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-MODEL="${MODEL:-/path/to/Qwen3-1.7B}"
+MODEL="${MODEL:-ckpt/50step}"
 EVAL_CONFIG="${EVAL_CONFIG:-data/preprocess/test/eval.yaml}"
 TP="${TP:-1}"
 N_SAMPLES="${N_SAMPLES:-16}"          # fallback when YAML doesn't set n_samples_per_eval_prompt

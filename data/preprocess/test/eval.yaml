@@ -1,6 +1,6 @@
 eval:
   defaults:
-    max_response_len: 16384
+    max_response_len: 32000
     top_p: 0.7
     input_key: prompt
     label_key: label

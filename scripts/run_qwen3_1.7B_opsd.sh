@@ -17,7 +17,7 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 # --- Configuration ---
 # Path to the Qwen3-1.7B checkpoint and data
-HF_CHECKPOINT=${HF_CHECKPOINT:-"/path/to/Qwen3-1.7B"}
+HF_CHECKPOINT=${HF_CHECKPOINT:-"/nfs/ofs-llm-ssd/models/opensource/Qwen3-1.7B"}
 PROMPT_DATA=${PROMPT_DATA:-"data/opsd_math_30k.jsonl"}
 SAVE_DIR=${SAVE_DIR:-"./checkpoints/qwen3-1.7b-opsd"}
 LOAD_DIR=${LOAD_DIR:-"${HF_CHECKPOINT}"}
@@ -45,12 +45,12 @@ ROLLOUT_ARGS=(
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-   --rollout-batch-size 16
+   --rollout-batch-size 32
    # Paper Table 6 (OPSD column): MaxCompletionLength=1024, SamplingTemperature=1.1.
    # Table 8 evaluation params add top_p=0.95, top_k=-1 (slime default); the OPSD
    # reference scripts also pass top_k=20 to vLLM. We use top_k=20 here to match
    # the reference; flip to -1 if you want the eval-time setting.
-   --rollout-max-response-len 8192
+   --rollout-max-response-len 16384
    --rollout-temperature 1.1
    --rollout-top-p 0.95
    --rollout-top-k 20
@@ -196,7 +196,6 @@ ray job submit --address="http://127.0.0.1:8088" \
     ${WANDB_ARGS[@]} \
     ${SGLANG_ARGS[@]} \
     ${MISC_ARGS[@]} \
-    --num-rollout 1000
-
+    --num-rollout 400
 # Cleanup
 # ray stop --force
