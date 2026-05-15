@@ -1406,11 +1406,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=256,
                 help=(
-                    "Token-axis chunk size for the vocab-parallel KL/RKL ops and the "
-                    "q_mix accumulation. Smaller values cap peak per-chunk memory at "
-                    "the cost of more kernel launches; reduce (e.g. 128 or 64) when "
-                    "OPSD OOMs at large response_length × vocab_size, raise when there "
-                    "is GPU memory headroom and you want fewer launch-bound kernels."
+                    "Token-axis chunk size for the fused vocab-parallel KL/RKL "
+                    "autograd (q_mix is recomputed per chunk, no persistent "
+                    "[T, V_local] buffer). Smaller values cap per-chunk peak "
+                    "memory at the cost of more kernel launches; raise when "
+                    "GPU has headroom. Pass -1 to disable token-dim chunking "
+                    "entirely (chunk = T); useful at long T when there is "
+                    "memory budget, since the q_mix persistent buffer is gone."
                 ),
             )
             parser.add_argument(

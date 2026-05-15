@@ -13,6 +13,7 @@ from collections.abc import Iterable
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 
@@ -51,64 +52,159 @@ def pairwise_unigram_jsd(tokens: list[list[int]]) -> np.ndarray:
     return dist
 
 
+def global_topk(
+    logits_local: torch.Tensor,
+    top_k: int,
+    shard_start: int,
+    tp_group,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k over a vocab-parallel logit shard.
+
+    Each rank contributes its local top-k, then all ranks select the global top-k
+    from the concatenated small candidate set. Returned indices are global vocab
+    ids and are identical on every TP rank.
+    """
+    k_local = min(top_k, logits_local.size(-1))
+    vals_local, idx_local = logits_local.topk(k_local, dim=-1)
+    idx_local = idx_local + shard_start
+
+    tp_size = dist.get_world_size(group=tp_group) if dist.is_available() and dist.is_initialized() else 1
+    if tp_size > 1:
+        vals_parts = [torch.empty_like(vals_local) for _ in range(tp_size)]
+        idx_parts = [torch.empty_like(idx_local) for _ in range(tp_size)]
+        dist.all_gather(vals_parts, vals_local.contiguous(), group=tp_group)
+        dist.all_gather(idx_parts, idx_local.contiguous(), group=tp_group)
+        vals_all = torch.cat(vals_parts, dim=-1)
+        idx_all = torch.cat(idx_parts, dim=-1)
+    else:
+        vals_all, idx_all = vals_local, idx_local
+
+    k = min(top_k, vals_all.size(-1))
+    vals, pos = vals_all.topk(k, dim=-1)
+    idx = idx_all.gather(-1, pos)
+    return vals, idx
+
+
+def gather_global_logits(
+    logits_local: torch.Tensor,
+    global_idx: torch.Tensor,
+    shard_start: int,
+    tp_group,
+) -> torch.Tensor:
+    """Gather arbitrary global vocab positions from vocab-parallel logits."""
+    V_local = logits_local.size(-1)
+    local_idx = global_idx - shard_start
+    owned = (local_idx >= 0) & (local_idx < V_local)
+    safe_idx = local_idx.clamp(0, V_local - 1)
+    vals = logits_local.gather(-1, safe_idx)
+    vals = vals.masked_fill(~owned, 0)
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size(group=tp_group) > 1:
+        dist.all_reduce(vals, op=dist.ReduceOp.SUM, group=tp_group)
+    return vals
+
+
 def pairwise_seq_jsd(
     logits_list: list[torch.Tensor],
     top_k: int,
     device: torch.device,
+    tp_group,
+    shard_start: int,
+    chunk_t: int,
 ) -> np.ndarray:
-    """[N, N] matrix of mean-token-JSD distances.
+    """[N, N] matrix of mean-token-JSD distances for TP-local logits.
 
-    logits_list: list of [T, V] tensors (CPU); pairs are moved to device one at a time
-    so peak GPU usage is 2 × [T, V] instead of [N, T, V].
+    logits_list contains [T, V_local] shards. The distance uses global top-k
+    vocab ids, but only communicates those top-k ids/logits instead of
+    materialising [T, V_full]. ``chunk_t < 0`` disables token-dim chunking.
     """
     n = len(logits_list)
     dist = np.zeros((n, n), dtype=np.float32)
+    T_full = logits_list[0].size(0) if n else 0
+    eff_chunk = T_full if chunk_t < 0 else chunk_t
+
+    top_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for logits in logits_list:
+        vals_chunks: list[torch.Tensor] = []
+        idx_chunks: list[torch.Tensor] = []
+        for t0 in range(0, logits.size(0), eff_chunk):
+            t1 = min(t0 + eff_chunk, logits.size(0))
+            l_gpu = logits[t0:t1].to(device, non_blocking=True)
+            vals, idx = global_topk(l_gpu, top_k, shard_start, tp_group)
+            vals_chunks.append(vals.detach().to("cpu"))
+            idx_chunks.append(idx.detach().to("cpu"))
+            del l_gpu, vals, idx
+        top_cache.append((torch.cat(vals_chunks, dim=0), torch.cat(idx_chunks, dim=0)))
+
     for i in range(n):
-        li = logits_list[i].to(device)
+        vi, ti = top_cache[i]
         for j in range(i + 1, n):
-            lj = logits_list[j].to(device)
-            d = _seq_jsd(li, lj, top_k)
+            vj, tj = top_cache[j]
+            d = _seq_jsd(
+                logits_list[i],
+                logits_list[j],
+                vi,
+                ti,
+                vj,
+                tj,
+                device,
+                shard_start,
+                tp_group,
+                eff_chunk,
+            )
             dist[i, j] = dist[j, i] = d
-            del lj
-        del li
     return dist
 
 
 # ── per-pair JSD helpers ──────────────────────────────────────────────────────
 
 
-def _seq_jsd(logits_i: torch.Tensor, logits_j: torch.Tensor, top_k: int) -> float:
-    """Mean per-token JSD between two logit sequences [T, V].
+def _seq_jsd(
+    logits_i: torch.Tensor,
+    logits_j: torch.Tensor,
+    top_vals_i: torch.Tensor,
+    top_idx_i: torch.Tensor,
+    top_vals_j: torch.Tensor,
+    top_idx_j: torch.Tensor,
+    device: torch.device,
+    shard_start: int,
+    tp_group,
+    chunk_t: int,
+) -> float:
+    """Mean per-token JSD over the union of each sequence's global top-k ids."""
+    total = 0.0
+    count = 0
+    T = logits_i.size(0)
+    for t0 in range(0, T, chunk_t):
+        t1 = min(t0 + chunk_t, T)
+        li = logits_i[t0:t1].to(device, non_blocking=True)
+        lj = logits_j[t0:t1].to(device, non_blocking=True)
+        vi = top_vals_i[t0:t1].to(device, non_blocking=True)
+        ti = top_idx_i[t0:t1].to(device, non_blocking=True)
+        vj = top_vals_j[t0:t1].to(device, non_blocking=True)
+        tj = top_idx_j[t0:t1].to(device, non_blocking=True)
 
-    Works in the union of each sequence's top-k vocabulary:
-    evaluates p_i at top-k(j) and p_j at top-k(i), then averages
-    two half-JSD terms so neither distribution loses mass.
-    """
-    k = min(top_k, logits_i.size(-1))
+        lp_i = F.log_softmax(vi.float(), dim=-1)  # [chunk, K]
+        lp_j = F.log_softmax(vj.float(), dim=-1)
+        pi, pj = lp_i.exp(), lp_j.exp()
 
-    tv_i, ti_i = logits_i.topk(k, dim=-1)  # [T, K]
-    tv_j, ti_j = logits_j.topk(k, dim=-1)
+        lv_j_at_i = F.log_softmax(gather_global_logits(lj, ti, shard_start, tp_group).float(), dim=-1)
+        lv_i_at_j = F.log_softmax(gather_global_logits(li, tj, shard_start, tp_group).float(), dim=-1)
+        pj_at_i, pi_at_j = lv_j_at_i.exp(), lv_i_at_j.exp()
 
-    lp_i = F.log_softmax(tv_i, dim=-1)  # [T, K]
-    lp_j = F.log_softmax(tv_j, dim=-1)
-    pi, pj = lp_i.exp(), lp_j.exp()
+        mix_i = 0.5 * (pi + pj_at_i)
+        log_mix_i = mix_i.clamp(min=1e-10).log()
+        jsd_i = 0.5 * ((pi * (lp_i - log_mix_i)).sum(-1) + (pj_at_i * (lv_j_at_i - log_mix_i)).sum(-1))
 
-    # Cross-evaluate: p_i over top-k(j) and vice-versa
-    lv_j_at_i = F.log_softmax(logits_j.gather(-1, ti_i), dim=-1)  # [T, K]
-    lv_i_at_j = F.log_softmax(logits_i.gather(-1, ti_j), dim=-1)  # [T, K]
-    pj_at_i, pi_at_j = lv_j_at_i.exp(), lv_i_at_j.exp()
+        mix_j = 0.5 * (pj + pi_at_j)
+        log_mix_j = mix_j.clamp(min=1e-10).log()
+        jsd_j = 0.5 * ((pj * (lp_j - log_mix_j)).sum(-1) + (pi_at_j * (lv_i_at_j - log_mix_j)).sum(-1))
 
-    # JSD over top-k(i): p_i vs p_j_at_i
-    mix_i = 0.5 * (pi + pj_at_i)
-    log_mix_i = mix_i.clamp(min=1e-10).log()
-    jsd_i = 0.5 * ((pi * (lp_i - log_mix_i)).sum(-1) + (pj_at_i * (lv_j_at_i - log_mix_i)).sum(-1))
+        chunk_jsd = (0.5 * (jsd_i + jsd_j)).clamp(min=0)
+        total += float(chunk_jsd.sum().item())
+        count += int(chunk_jsd.numel())
+        del li, lj, vi, ti, vj, tj, lp_i, lp_j, pi, pj, lv_j_at_i, lv_i_at_j, pj_at_i, pi_at_j
 
-    # JSD over top-k(j): p_j vs p_i_at_j
-    mix_j = 0.5 * (pj + pi_at_j)
-    log_mix_j = mix_j.clamp(min=1e-10).log()
-    jsd_j = 0.5 * ((pj * (lp_j - log_mix_j)).sum(-1) + (pi_at_j * (lv_i_at_j - log_mix_j)).sum(-1))
-
-    return float((0.5 * (jsd_i + jsd_j)).clamp(min=0).mean().item())
+    return total / max(count, 1)
 
 
 def _unigram_jsd(tokens_i: Iterable[int], tokens_j: Iterable[int]) -> float:

@@ -39,8 +39,8 @@ Source-of-truth files (read in this order):
 | Quality scoring (Len + Format + Conf) | `slime_plugins/opsd/rollout.py:_structural_score` + `distillation.py:add_conf` |
 | Diversity selection | `slime_plugins/opsd/selection.py:kcenter` |
 | Mixture weights w_k^t | `slime_plugins/opsd/distillation.py:mixture_weights` |
-| Forward-KL custom autograd | `slime_plugins/opsd/distillation.py:VocabParallelKLDiv` |
-| RKL custom autograd | `slime_plugins/opsd/distillation.py:VocabParallelRKLDiv` |
+| Forward-KL custom autograd (q_mix fused) | `slime_plugins/opsd/distillation.py:VocabParallelMixtureKLDiv` |
+| RKL custom autograd (q_mix fused) | `slime_plugins/opsd/distillation.py:VocabParallelMixtureRKLDiv` |
 | Frozen-teacher swap | `slime_plugins/opsd/plugin.py:before_train_step_hook` |
 | Loss + metrics composition | `slime_plugins/opsd/plugin.py:loss_function` |
 

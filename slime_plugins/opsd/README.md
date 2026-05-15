@@ -46,9 +46,11 @@ autograd-tracked student forward starts.
 `loss_function` then pops the precomputed teacher outputs per microbatch and
 runs only the student-dependent parts (mixture weights, `q_mix`, KL).
 
-Memory at peak (Qwen3, N=4, T=2048, V≈152k, bf16): ~600 MB per trace × N × num
-microbatches on host RAM; GPU only ever holds one microbatch's teacher logits at
-a time, matching the legacy in-loss path.
+Memory at peak (Qwen3, N=4, T=2048, V≈152k, bf16): teacher shards are TP-local
+[T, V/tp], so host RAM scales as ~600/tp MB per trace × N × num microbatches.
+GPU only ever holds one chunk worth of teacher logits at a time during the
+fused KL forward+backward, matching the streaming behavior of the legacy
+in-loss path.
 
 A previous attempt (**path A**) swapped weights inside `loss_function`, but
 `weights_backuper.restore` bumps the parameter's storage version counter via
@@ -85,8 +87,15 @@ legacy behavior of running teacher forwards against the current student weights.
   Token-JSD is the default and the recommended diversity metric; switch to
   unigram-JSD if q-forward cost dominates wall-clock and you can tolerate the
   approximation.
-- q_mix is built with GPU-side softmax over the full vocab (peak GPU delta
-  ≈ [chunk, V_full] float32 ≈ 150 MB at chunk=256, V=152k).
+- q_mix is **never** materialised as a persistent [T, V_local] buffer.
+  Both forward-KL and reverse-KL run through fused vocab-parallel custom
+  autograd ops (`VocabParallelMixture{KL,RKL}Div`) that stream the N teacher
+  shards once per pass and reconstruct q_mix at chunk granularity; only a
+  [chunk_t, V_local] fp32 accumulator is alive at peak. At T=16384, V=152k
+  this saves several GB of resident GPU memory vs. accumulating q_mix first.
+  `--opsd-kl-chunk=-1` disables token-dim chunking entirely (chunk = T) when
+  memory budget allows; positive values keep the chunked path for OOM
+  headroom on tight setups.
 
 ## Files
 
@@ -177,7 +186,7 @@ Conf, unigram-JSD diversity, hybrid GRPO+OPSD loss, RKL aux) are opt-in.
 | `--opsd-quality-conf-norm` | `rank` | Normalize Conf across a sample's candidates so η_c lives on the same [0,1] axis as the structural terms. Modes: `rank` / `zscore` / `minmax` / `raw` (literal mean log-prob) |
 | `--opsd-diversity-metric` | `token_jsd` | `token_jsd` (recommended) or `unigram_jsd` (cheap approximation) |
 | `--opsd-diversity-top-k` | `128` | Vocab truncation for token-JSD diversity |
-| `--opsd-kl-chunk` | `256` | Token-dim chunk for the vocab-parallel KL/RKL forward+backward. Lower if you see OOMs; raise if compute-bound on small vocab |
+| `--opsd-kl-chunk` | `256` | Token-dim chunk for the fused vocab-parallel KL/RKL autograd (q_mix is recomputed per chunk; no persistent [T, V_local] buffer). Pass `-1` to disable chunking (chunk = T) when memory allows; lower the value if you see OOMs |
 | `--opsd-freeze-teacher` | `True` | Use frozen initial-policy snapshot as the teacher. Disable with `--no-opsd-freeze-teacher` |
 
 ## External teacher (not OPSD, but supported)

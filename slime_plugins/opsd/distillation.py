@@ -33,7 +33,7 @@ def _is_rank0() -> bool:
 
 from slime.backends.megatron_utils.loss import get_responses
 
-from .selection import kcenter, pairwise_seq_jsd, pairwise_unigram_jsd
+from .selection import gather_global_logits, global_topk, kcenter, pairwise_seq_jsd, pairwise_unigram_jsd
 
 _TRANSITION_PROMPT = (
     "\n\nAfter reading the reference solution above, make sure you truly understand "
@@ -151,20 +151,15 @@ def teacher_forward(
     inputs: list[torch.Tensor],
     resp_len: int,
 ) -> list[torch.Tensor]:
-    """Run π_θ(·| x, τ_k, y_{<t}) one trace at a time; return GPU logits.
+    """Run π_θ(·| x, τ_k, y_{<t}) one trace at a time; return TP-local logits.
 
-    Returns full-vocab teacher logits [resp_len, V_full] per input, on the same
-    device as the model. q_k^t at position t is taken from logit position
+    Returns vocab-parallel teacher logits [resp_len, V_local] per input, on the
+    same device as the model. q_k^t at position t is taken from logit position
     prompt_len + t - 1 (causal-LM convention: output[i] predicts input[i+1]),
     matching the slicing used by slime's own `get_responses`
     (`logits[start-1 : end-1]`).
-
-    Memory note: with N=4 selected traces and Qwen3 (V≈152k), retained GPU
-    memory is N × [T, V] × 4 B ≈ 4.8 GB at T=2048 — fits comfortably alongside
-    the 1.7B model. For very large N or very long responses, switch to
-    `.cpu()` after the slice if memory becomes tight.
     """
-    from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_model_parallel_world_size
+    from megatron.core.parallel_state import get_tensor_model_parallel_world_size
 
     tp_size = get_tensor_model_parallel_world_size()
     teacher_logits: list[torch.Tensor] = []
@@ -188,18 +183,12 @@ def teacher_forward(
             )
         del inp_model
         raw = out[0] if isinstance(out, tuple) else out
-        # output[i] predicts input[i+1]; response positions [P, P+T) ← logits [P-1, P+T-1).
+        # output[i] predicts input[i+1]; response positions [P, P+T) <- logits [P-1, P+T-1).
         # P = orig_len - resp_len, so the slice is [orig_len - resp_len - 1, orig_len - 1).
-        # With TP > 1 the model returns vocab-parallel logits [T, V/tp]; all-gather
-        # to full vocab [T, V] so downstream gathers / q_mix shards are consistent.
-        logit_t = raw[0, orig_len - resp_len - 1 : orig_len - 1].float()  # [T, V_local]
+        # Keep vocab-parallel logits. Gathering [T, V_full] is the dominant OPSD
+        # OOM source at long response lengths, and downstream code is TP-aware.
+        logit_t = raw[0, orig_len - resp_len - 1 : orig_len - 1].contiguous()  # [T, V_local]
         del out, raw
-
-        if tp_size > 1:
-            tp_group = get_tensor_model_parallel_group()
-            shards = [torch.empty_like(logit_t) for _ in range(tp_size)]
-            torch.distributed.all_gather(shards, logit_t.contiguous(), group=tp_group)
-            logit_t = torch.cat(shards, dim=-1)  # [T, V_full]
 
         teacher_logits.append(logit_t)
 
@@ -220,9 +209,15 @@ def compute_trace_confs(
     [P-1, P+|τ|-1) where P = len(chat(x)), then evaluates the log-prob of
     τ_k[t] at each position.
     """
-    from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_model_parallel_world_size
+    from megatron.core.parallel_state import (
+        get_tensor_model_parallel_group,
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
 
     tp_size = get_tensor_model_parallel_world_size()
+    tp_group = get_tensor_model_parallel_group()
+    tp_rank = get_tensor_model_parallel_rank()
     confs: list[float] = []
 
     for inp, trace_t in zip(conf_inputs, trace_tokens_flat, strict=True):
@@ -230,7 +225,6 @@ def compute_trace_confs(
         trace_len = trace_t.size(0)
         pad_len = (-orig_len) % tp_size
         inp_model = F.pad(inp, (0, pad_len)) if pad_len else inp
-        device = inp.device
 
         with torch.no_grad():
             out = model(
@@ -245,14 +239,10 @@ def compute_trace_confs(
         logit_t = raw[0, orig_len - trace_len - 1 : orig_len - 1].float()  # [trace_len, V_local]
         del out, raw
 
-        if tp_size > 1:
-            tp_group = get_tensor_model_parallel_group()
-            shards = [torch.empty_like(logit_t) for _ in range(tp_size)]
-            torch.distributed.all_gather(shards, logit_t.contiguous(), group=tp_group)
-            logit_t = torch.cat(shards, dim=-1)  # [trace_len, V_full]
-
-        lse = torch.logsumexp(logit_t, dim=-1)
-        at_trace = logit_t[torch.arange(trace_len, device=device), trace_t]
+        lse = vocab_parallel_lse_chunk(logit_t, tp_group).squeeze(-1)
+        V_local = logit_t.size(-1)
+        shard_start = tp_rank * V_local
+        at_trace = gather_global_logits(logit_t, trace_t.unsqueeze(-1), shard_start, tp_group).squeeze(-1)
         confs.append((at_trace - lse).mean().item())
         del logit_t, lse, at_trace
 
@@ -323,6 +313,8 @@ def select_diverse(
     tokens: list[list[int]],
     logits_cpu: list[torch.Tensor] | None,
     device: torch.device,
+    tp_group,
+    shard_start: int,
 ) -> list[int]:
     """Select N diverse candidates via k-center greedy (ALGO.md Part 1 §5).
 
@@ -335,7 +327,9 @@ def select_diverse(
 
     if args.opsd_diversity_metric == "token_jsd":
         assert logits_cpu is not None, "token_jsd diversity requires teacher logits"
-        dist = pairwise_seq_jsd(logits_cpu, args.opsd_diversity_top_k, device)
+        dist = pairwise_seq_jsd(
+            logits_cpu, args.opsd_diversity_top_k, device, tp_group, shard_start, args.opsd_kl_chunk
+        )
     else:
         dist = pairwise_unigram_jsd(tokens)
 
@@ -347,9 +341,8 @@ def select_diverse(
 
 def mixture_weights(
     args,
-    p_student: torch.Tensor,
+    p_gathered: torch.Tensor,
     q_gathered: torch.Tensor,
-    weight_idx: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute per-token mixture weights w_k^t (ALGO.md Part 1 §7).
 
@@ -363,9 +356,8 @@ def mixture_weights(
     All computed on the student's top-K vocabulary for efficiency.
 
     Args:
-        p_student:   [T, V] student logits.
-        q_gathered:  [N, T, K] teacher logits pre-gathered at weight_idx positions.
-        weight_idx:  [T, K] student top-K token indices used for gathering.
+        p_gathered:  [T, K] student logits at global top-K positions.
+        q_gathered:  [N, T, K] teacher logits at the same global top-K positions.
 
     Returns:
         w:                [N, T] softmax-normalised mixture weights.
@@ -377,13 +369,13 @@ def mixture_weights(
     """
     N = q_gathered.size(0)
 
-    p_log = F.log_softmax(p_student.gather(-1, weight_idx) / args.opsd_temperature, dim=-1)  # [T, K]
+    p_log = F.log_softmax(p_gathered / args.opsd_temperature, dim=-1)  # [T, K]
     q_log = F.log_softmax(q_gathered / args.opsd_temperature, dim=-1)  # [N, T, K]
     q_prob = q_log.exp()
 
     delta = (q_prob * (q_log - p_log.unsqueeze(0))).sum(-1).clamp(min=0)  # [N, T]
     entropy = -(q_prob * q_log).sum(-1)  # [N, T]
-    diversity = _pairwise_jsd(q_prob, q_log) if N > 1 else torch.zeros(N, p_log.size(0), device=p_student.device)
+    diversity = _pairwise_jsd(q_prob, q_log) if N > 1 else torch.zeros(N, p_log.size(0), device=p_gathered.device)
 
     logits = -args.opsd_kl_weight * delta - args.opsd_entropy_weight * entropy + args.opsd_diversity_weight * diversity
     w = F.softmax(logits, dim=0)  # [N, T]
@@ -399,7 +391,7 @@ def mixture_weights(
         w_entropy = (-(w * log_w).sum(0)).clamp(min=0)  # [T] in nats
         w_entropy_norm = w_entropy / math.log(N)
     else:
-        w_entropy_norm = torch.zeros(p_log.size(0), device=p_student.device)
+        w_entropy_norm = torch.zeros(p_log.size(0), device=p_gathered.device)
 
     if _is_rank0():
         wn = w_entropy_norm.detach()
@@ -457,20 +449,24 @@ def _pairwise_jsd(q_prob: torch.Tensor, q_log: torch.Tensor) -> torch.Tensor:
 
     Returns:
         [N, T]
+
+    Iterates over the N(N-1)/2 unique pairs instead of broadcasting to
+    [N, N, T, K] — the broadcast form is ~N² × [T, K] in peak memory which
+    blows past 1 GB at N=4, T=16k, K=512.
     """
-    N = q_prob.size(0)
-    pi = q_prob.unsqueeze(1)  # [N, 1, T, K]
-    pj = q_prob.unsqueeze(0)  # [1, N, T, K]
-    lpi = q_log.unsqueeze(1)
-    lpj = q_log.unsqueeze(0)
-
-    mix = 0.5 * (pi + pj)
-    log_mix = mix.clamp(min=1e-10).log()
-    jsd = 0.5 * ((pi * (lpi - log_mix)).sum(-1) + (pj * (lpj - log_mix)).sum(-1)).clamp(min=0)  # [N, N, T]
-
-    eye = torch.eye(N, dtype=torch.bool, device=q_prob.device)
-    jsd = jsd.masked_fill(eye.unsqueeze(-1), 0.0)
-    return jsd.sum(dim=1) / (N - 1)  # [N, T]
+    N, T, _ = q_prob.shape
+    sum_jsd = torch.zeros(N, T, device=q_prob.device, dtype=q_prob.dtype)
+    for i in range(N):
+        pi = q_prob[i]
+        lpi = q_log[i]
+        for j in range(i + 1, N):
+            pj = q_prob[j]
+            lpj = q_log[j]
+            log_mix = (0.5 * (pi + pj)).clamp(min=1e-10).log()
+            jsd_ij = 0.5 * ((pi * (lpi - log_mix)).sum(-1) + (pj * (lpj - log_mix)).sum(-1)).clamp(min=0)  # [T]
+            sum_jsd[i].add_(jsd_ij)
+            sum_jsd[j].add_(jsd_ij)
+    return sum_jsd / (N - 1)  # [N, T]
 
 
 # ── vocab-parallel KL divergence (§9) ───────────────────────────────────────
@@ -492,44 +488,83 @@ def vocab_parallel_lse_chunk(c: torch.Tensor, tp_group) -> torch.Tensor:
     return gmax + gsum.log()
 
 
-class VocabParallelKLDiv(torch.autograd.Function):
-    """Forward-KL(q_mix ‖ p_θ) for vocab-parallel student logits.
+def vocab_parallel_softmax_chunk(c: torch.Tensor, tp_group) -> torch.Tensor:
+    """Softmax over a vocab-parallel logit shard."""
+    return (c - vocab_parallel_lse_chunk(c.float(), tp_group)).exp()
 
-    Each TP rank holds [T, V_local].  Forward is a single chunked pass over
-    the token dim that interleaves the distributed LSE and the KL contribution
-    (no separate phase 1).  We never materialise [T, V_full] anywhere.
 
-    Backward: ``d(KL)/d(logit_u) = softmax_u − q_u`` (or, with clipping,
-    ``s · softmax_u − mask_u · q_u``).  Rather than save a [T, V_local]
-    grad buffer between forward and backward (~600 MB at TP=1 / V≈152k),
-    we save only the tiny inputs needed to recompute softmax on the fly:
+def _accumulate_q_mix_chunk(
+    teacher_logits: tuple[torch.Tensor, ...],
+    w: torch.Tensor,
+    t0: int,
+    t1: int,
+    V_local: int,
+    device: torch.device,
+    tp_group,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build q_mix^{t0:t1} = Σ_k w_k · softmax(q_k) on the fly.
 
-        ctx.save_for_backward(logit_local, q_local, lse, s_or_empty)
+    Streams the N teacher chunks CPU→GPU one at a time and folds each into
+    a single fp32 accumulator via ``addcmul_`` — no intermediate ``s_k * w_k``
+    tensor. ``vocab_parallel_softmax_chunk`` already upcasts inside its LSE,
+    so bf16 input avoids an extra .float() temporary on the caller side.
+    """
+    N = len(teacher_logits)
+    q_chunk = torch.zeros(t1 - t0, V_local, dtype=torch.float32, device=device)
+    for k in range(N):
+        tk = teacher_logits[k][t0:t1].to(device, non_blocking=True)
+        s_k = vocab_parallel_softmax_chunk(tk, tp_group)  # fp32 [c, V_local]
+        q_chunk.addcmul_(s_k, w[k, t0:t1].unsqueeze(-1).float())
+        del tk, s_k
+    return q_chunk.to(out_dtype)
 
-    ``logit_local`` is already pinned by Megatron's autograd saved activations
-    and ``q_local`` is already alive in the caller, so re-saving them is just
-    a Python reference — zero extra bytes.  ``lse`` and ``s_local`` are [T]
-    (≪ KB).  Cost is one extra chunked softmax pass during backward; loss
-    compute is dwarfed by the model fwd/bwd, so this is effectively free.
+
+class VocabParallelMixtureKLDiv(torch.autograd.Function):
+    """Forward-KL(q_mix ‖ p_θ) with q_mix fused into the autograd op.
+
+    ``q_mix^t_v = Σ_k w_k^t · softmax(q_k^t)_v`` is **never** materialised as
+    a [T, V_local] persistent buffer. Both forward and backward stream the N
+    teacher logit shards once and recompute the chunk-sized q_mix on the fly.
+    This eliminates the dominant persistent OPSD GPU buffer at long response
+    lengths (~5–10 GB at T=16k, V=152k fp32, depending on TP).
+
+    Saved between forward and backward:
+      • ``logit_local``        — student, already an autograd input
+      • ``lse``                — [T]
+      • ``s_or_empty``         — [T] when clipping; empty sentinel otherwise
+      • ``w``                  — [N, T] mixture weights
+      • ``*teacher_logits``    — N shards [T, V_local], may live on CPU
+
+    Teacher tensors are passed as positional args so save_for_backward retains
+    references without copying (the caller's ``sample_teacher_outputs`` keeps
+    them alive on CPU; chunks are pulled to GPU once per pass).
 
     Per-(position, vocab-entry) KL clipping (paper §3.2 / Figure 4):
-      ℓ_{n,v} = q_v · (log q_v − log p_v) clipped to ``clip``.  Backward
-      becomes ``s · softmax_u − mask_u · q_u`` with ``mask = (ℓ < clip)``
-      and ``s = Σ_v mask_v · q_v`` (TP all-reduced).
+      ℓ_{n,v} = q_v · (log q_v − log p_v) clipped to ``clip``. Backward becomes
+      ``s · softmax_u − mask_u · q_u`` with ``mask = (ℓ < clip)`` and
+      ``s = Σ_v mask_v · q_v`` (TP all-reduced).
     """
 
     @staticmethod
     def forward(
         ctx,
         logit_local: torch.Tensor,  # [T, V_local], requires_grad
-        q_local: torch.Tensor,  # [T, V_local], detached q_mix shard
+        w: torch.Tensor,  # [N, T], detached mixture weights
         tp_group,
         chunk_t: int,
         clip: float | None,
+        *teacher_logits: torch.Tensor,  # N shards of [T, V_local]; CPU or GPU
     ) -> torch.Tensor:  # [T]
-        T, _ = logit_local.shape
+        T, V_local = logit_local.shape
+        N = len(teacher_logits)
+        assert w.shape == (N, T), f"w shape {tuple(w.shape)} != ({N}, {T})"
+        if chunk_t < 0:
+            chunk_t = T
         tp_size = dist.get_world_size(group=tp_group)
         clip_enabled = clip is not None
+        device = logit_local.device
+        out_dtype = logit_local.dtype
 
         lse = logit_local.new_empty(T)
         kl_local = logit_local.new_zeros(T)
@@ -537,18 +572,27 @@ class VocabParallelKLDiv(torch.autograd.Function):
 
         for t0 in range(0, T, chunk_t):
             t1 = min(t0 + chunk_t, T)
+            qc = _accumulate_q_mix_chunk(teacher_logits, w, t0, t1, V_local, device, tp_group, out_dtype)
             lc = logit_local[t0:t1]
-            qc = q_local[t0:t1]
             lse_chunk = vocab_parallel_lse_chunk(lc, tp_group)  # [c, 1]
             lse[t0:t1] = lse_chunk.squeeze(-1)
             log_p = lc - lse_chunk  # [c, V_local]
-            per_entry = qc * (qc.clamp(min=1e-10).log() - log_p)
+            del lse_chunk
+            # Build per_entry = qc * (log qc - log p) with in-place chaining so
+            # only one [c, V_local] tensor (`buf`, aliasing the clamp result) is
+            # alive on top of qc + log_p.  At chunk_t=T this triples headroom
+            # compared to the naive 3-op compositional form.
+            buf = qc.clamp(min=1e-10).log_().sub_(log_p).mul_(qc)
+            del log_p
             if clip_enabled:
                 assert s_local is not None
-                mask = per_entry < clip
-                per_entry = torch.where(mask, per_entry, per_entry.new_full((), clip))
+                mask = buf < clip
+                # s = Σ_v mask_v · q_v (TP-summed later)
                 s_local[t0:t1] = (mask.to(qc.dtype) * qc).sum(-1)
-            kl_local[t0:t1] = per_entry.sum(-1)
+                buf = torch.where(mask, buf, buf.new_full((), clip))
+                del mask
+            kl_local[t0:t1] = buf.sum(-1)
+            del qc, buf
 
         if tp_size > 1:
             dist.all_reduce(kl_local, op=dist.ReduceOp.SUM, group=tp_group)
@@ -556,98 +600,143 @@ class VocabParallelKLDiv(torch.autograd.Function):
                 assert s_local is not None
                 dist.all_reduce(s_local, op=dist.ReduceOp.SUM, group=tp_group)
 
-        # save_for_backward requires tensors; use an empty tensor as the "no s" sentinel.
-        ctx.save_for_backward(logit_local, q_local, lse, s_local if clip_enabled else logit_local.new_empty(0))
+        ctx.save_for_backward(
+            logit_local,
+            lse,
+            s_local if clip_enabled else logit_local.new_empty(0),
+            w,
+            *teacher_logits,
+        )
+        ctx.tp_group = tp_group
         ctx.chunk_t = chunk_t
         ctx.clip_enabled = clip_enabled
         ctx.clip = clip
+        ctx.n_teachers = N
         return kl_local
 
     @staticmethod
     def backward(ctx, grad_kl: torch.Tensor):
-        logit_local, q_local, lse, s_local = ctx.saved_tensors
+        saved = ctx.saved_tensors
+        logit_local, lse, s_local = saved[0], saved[1], saved[2]
+        w = saved[3]
+        teacher_logits = saved[4:]
+        tp_group = ctx.tp_group
         chunk_t = ctx.chunk_t
         clip_enabled = ctx.clip_enabled
-        T, _ = logit_local.shape
+        T, V_local = logit_local.shape
+        device = logit_local.device
+        out_dtype = logit_local.dtype
 
         grad = torch.empty_like(logit_local)
         for t0 in range(0, T, chunk_t):
             t1 = min(t0 + chunk_t, T)
-            qc = q_local[t0:t1]
-            sm_c = (logit_local[t0:t1] - lse[t0:t1].unsqueeze(-1)).exp()
+            qc = _accumulate_q_mix_chunk(teacher_logits, w, t0, t1, V_local, device, tp_group, out_dtype)
+            log_p = logit_local[t0:t1] - lse[t0:t1].unsqueeze(-1)  # [c, V_local]
             scale = grad_kl[t0:t1].unsqueeze(-1)
             if clip_enabled:
-                # mask depends on log p, which we don't save (just lse) — recompute.
-                log_p = logit_local[t0:t1] - lse[t0:t1].unsqueeze(-1)
-                per_entry = qc * (qc.clamp(min=1e-10).log() - log_p)
-                mask_q = (per_entry < ctx.clip).to(qc.dtype) * qc
-                grad[t0:t1] = scale * (sm_c * s_local[t0:t1].unsqueeze(-1) - mask_q)
+                # mask depends on per-entry pre-clip value; recompute it from
+                # (qc, log_p) to avoid persisting the [c, V_local] mask between
+                # forward and backward.
+                per_entry = qc.clamp(min=1e-10).log().sub_(log_p).mul_(qc)
+                mask_q = (per_entry < ctx.clip).to(qc.dtype).mul_(qc)
+                sm_c = log_p.exp_()
+                grad[t0:t1] = sm_c.mul_(s_local[t0:t1].unsqueeze(-1)).sub_(mask_q).mul_(scale)
+                del per_entry, mask_q, sm_c
             else:
-                grad[t0:t1] = scale * (sm_c - qc)
-        return grad, None, None, None, None
+                # grad = scale * (softmax(p) - q_mix); fused in-place on log_p
+                sm_c = log_p.exp_()
+                grad[t0:t1] = sm_c.sub_(qc).mul_(scale)
+                del sm_c
+            del qc, log_p
+
+        return (grad, None, None, None, None, *([None] * ctx.n_teachers))
 
 
-class VocabParallelRKLDiv(torch.autograd.Function):
-    """Reverse-KL: KL(p_θ ‖ q_mix), vocab-parallel.
+class VocabParallelMixtureRKLDiv(torch.autograd.Function):
+    """Reverse-KL: KL(p_θ ‖ q_mix), q_mix fused into the autograd op.
 
-    Same forward/backward shape as ``VocabParallelKLDiv`` (single chunked
-    forward, recompute-in-backward).  Used as ALGO.md Part 1 §9's optional
-    auxiliary term ``L_RKL`` (with ``α << 1``).
+    Same fusing strategy as ``VocabParallelMixtureKLDiv``: q_mix never persists
+    between forward and backward; both passes recompute it per chunk.
 
     Per position n:
-        L_n = Σ_v p_v (log p_v − log q_v)
+        L_n = Σ_v p_v · (log p_v − log q_v)
         d L_n / d(logit_u) = p_u · ((log p_u − log q_u) − L_n)
 
-    Saved-for-backward: ``(logit_local, q_local, lse, kl)`` — all tiny or
-    pre-existing.  Replaces the old ``p_buf`` + ``log_p_minus_log_q_p`` pair
-    (~1.2 GB persistent at TP=1 / V≈152k).
+    Used as ALGO.md Part 1 §9's optional auxiliary term ``L_RKL`` (α_RKL ≪ 1).
     """
 
     @staticmethod
     def forward(
         ctx,
         logit_local: torch.Tensor,
-        q_local: torch.Tensor,
+        w: torch.Tensor,
         tp_group,
         chunk_t: int,
+        *teacher_logits: torch.Tensor,
     ) -> torch.Tensor:
-        T, _ = logit_local.shape
+        T, V_local = logit_local.shape
+        N = len(teacher_logits)
+        assert w.shape == (N, T), f"w shape {tuple(w.shape)} != ({N}, {T})"
+        if chunk_t < 0:
+            chunk_t = T
         tp_size = dist.get_world_size(group=tp_group)
+        device = logit_local.device
+        out_dtype = logit_local.dtype
 
         lse = logit_local.new_empty(T)
         kl_local = logit_local.new_zeros(T)
 
         for t0 in range(0, T, chunk_t):
             t1 = min(t0 + chunk_t, T)
+            qc = _accumulate_q_mix_chunk(teacher_logits, w, t0, t1, V_local, device, tp_group, out_dtype)
             lc = logit_local[t0:t1]
-            qc = q_local[t0:t1].clamp(min=1e-10)
             lse_chunk = vocab_parallel_lse_chunk(lc, tp_group)
             lse[t0:t1] = lse_chunk.squeeze(-1)
-            log_p = lc - lse_chunk
-            p = log_p.exp()
-            kl_local[t0:t1] = (p * (log_p - qc.log())).sum(-1)
+            log_p = lc - lse_chunk  # [c, V_local]
+            del lse_chunk
+            p = log_p.exp()  # [c, V_local]
+            # diff = log_p - log_qc; reuse log_p buffer in-place.
+            log_p.sub_(qc.clamp(min=1e-10).log_())
+            # kl_n = Σ_v p · diff; reuse p buffer in-place.
+            kl_local[t0:t1] = p.mul_(log_p).sum(-1)
+            del qc, log_p, p
 
         if tp_size > 1:
             dist.all_reduce(kl_local, op=dist.ReduceOp.SUM, group=tp_group)
 
-        ctx.save_for_backward(logit_local, q_local, lse, kl_local)
+        ctx.save_for_backward(logit_local, lse, kl_local, w, *teacher_logits)
+        ctx.tp_group = tp_group
         ctx.chunk_t = chunk_t
+        ctx.n_teachers = N
         return kl_local
 
     @staticmethod
     def backward(ctx, grad_kl: torch.Tensor):
-        logit_local, q_local, lse, kl = ctx.saved_tensors
+        saved = ctx.saved_tensors
+        logit_local, lse, kl = saved[0], saved[1], saved[2]
+        w = saved[3]
+        teacher_logits = saved[4:]
+        tp_group = ctx.tp_group
         chunk_t = ctx.chunk_t
-        T, _ = logit_local.shape
+        T, V_local = logit_local.shape
+        device = logit_local.device
+        out_dtype = logit_local.dtype
 
         grad = torch.empty_like(logit_local)
         for t0 in range(0, T, chunk_t):
             t1 = min(t0 + chunk_t, T)
-            qc = q_local[t0:t1].clamp(min=1e-10)
-            log_p = logit_local[t0:t1] - lse[t0:t1].unsqueeze(-1)
-            p = log_p.exp()
-            grad[t0:t1] = grad_kl[t0:t1].unsqueeze(-1) * p * (log_p - qc.log() - kl[t0:t1].unsqueeze(-1))
-        return grad, None, None, None
+            qc = _accumulate_q_mix_chunk(teacher_logits, w, t0, t1, V_local, device, tp_group, out_dtype)
+            log_p = logit_local[t0:t1] - lse[t0:t1].unsqueeze(-1)  # [c, V_local]
+            p = log_p.exp()  # [c, V_local]
+            # diff = log_p − log_qc − kl_n; mutate log_p in place to avoid an
+            # extra [c, V_local] alloc.
+            log_p.sub_(qc.clamp(min=1e-10).log_()).sub_(kl[t0:t1].unsqueeze(-1))
+            del qc
+            # grad = scale · p · diff; in-place on log_p.
+            grad[t0:t1] = log_p.mul_(p).mul_(grad_kl[t0:t1].unsqueeze(-1))
+            del log_p, p
+
+        return (grad, None, None, None, *([None] * ctx.n_teachers))
 
 
 # ── KL distillation loss (§8-9) ───────────────────────────────────────────────
@@ -680,9 +769,14 @@ def prepare_teacher_outputs(
     so the GPU tensors are consumed immediately by `distillation_loss`.
 
     For each sample the returned dict carries:
-      * `sel_logits`: list of N teacher-logit tensors, each [T, V_full],
+      * `sel_logits`: list of N teacher-logit tensors, each [T, V_local],
         on CPU when offloaded.
     """
+    from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_model_parallel_rank
+
+    tp_group = get_tensor_model_parallel_group()
+    tp_rank = get_tensor_model_parallel_rank()
+
     q_inputs, conf_inputs, trace_tokens_flat, counts, cand_scores, cand_tokens = build_teacher_inputs(
         batch, metadata_list, unconcat_tokens, tokenizer
     )
@@ -724,20 +818,22 @@ def prepare_teacher_outputs(
 
         # §5 + §6 — diversity selection + teacher_forward, order metric-dependent.
         if args.opsd_diversity_metric == "unigram_jsd":
-            sel = select_diverse(args, scores, tokens_i, None, device)
+            sel = select_diverse(args, scores, tokens_i, None, device, tp_group, 0)
             q_in_sel = [q_in_sub[k] for k in sel]
             sel_logits = teacher_forward(model, q_in_sel, resp_len)
         else:
             all_logits = teacher_forward(model, q_in_sub, resp_len)
-            sel = select_diverse(args, scores, tokens_i, all_logits, device)
+            V_local = all_logits[0].size(-1)
+            shard_start = tp_rank * V_local
+            sel = select_diverse(args, scores, tokens_i, all_logits, device, tp_group, shard_start)
             sel_logits = [all_logits[k] for k in sel]
             del all_logits
 
         if offload_to_cpu:
             # Detach + move to CPU so subsequent weight swap / student forward
-            # can run without interfering with these tensors.  ~600 MB per trace
-            # at T=2048, V≈152k, bf16; for N=4 / 8 microbatches that's ~19 GB
-            # CPU RAM peak — well below the OOM risk of keeping them on GPU.
+            # can run without interfering with these tensors.  They are TP-local
+            # [T, V_local] shards, so CPU and GPU peak scale with V/tp instead
+            # of V_full.
             sel_logits = [t.detach().to("cpu") for t in sel_logits]
 
         outputs.append({"sel_logits": sel_logits})
@@ -795,6 +891,7 @@ def distillation_loss(
     for i, sample_out in enumerate(sample_teacher_outputs):
         p_student = student_logits[i]  # [T, V_local] vocab-parallel
         T = p_student.size(0)
+        eff_chunk = T if chunk_t < 0 else chunk_t
 
         if sample_out is None:
             # No privileged candidates → contribute zero loss but keep the
@@ -810,49 +907,43 @@ def distillation_loss(
         V_local = p_student.size(1)
         shard_start = tp_rank * V_local  # global vocab offset for this TP rank
 
-        # Stream teacher logits one trace at a time: with N=4 / T=8192 / V≈152k,
-        # bulk-moving all N to GPU costs ~19 GB; we only need one [T, V_full]
-        # resident at a time. When sel_logits are already on GPU (inline path),
-        # `.to(device)` is a no-op and the originals persist via the list ref.
+        # Teacher logits are TP-local [T, V_local] shards held by `sample_out`
+        # (CPU when offloaded). The fused KL autograd streams them per chunk in
+        # both forward and backward, so there is no persistent [T, V_local]
+        # q_mix buffer at OPSD scope — only chunk-sized fp32 accumulators.
         sel_src: list[torch.Tensor] = sample_out["sel_logits"]
 
-        # §7 — mixture weights using this TP rank's local top-K student tokens.
-        top_k = min(args.opsd_weight_top_k, V_local)
-        _, weight_idx = torch.topk(p_student / args.opsd_temperature, k=top_k, dim=-1)  # [T, K]
-        gathered_list: list[torch.Tensor] = []
-        for ltsr in sel_src:
-            l_gpu = ltsr.to(device, non_blocking=True)
-            l_shard = l_gpu[:, shard_start : shard_start + V_local]
-            gathered_list.append(l_shard.gather(-1, weight_idx))
-            del l_shard, l_gpu
-        q_gathered = torch.stack(gathered_list, dim=0)  # [N, T, K]
-        del gathered_list
-        w, w_entropy_norm = mixture_weights(args, p_student, q_gathered, weight_idx)
-        del q_gathered, weight_idx
+        # §7 — mixture weights use a global top-K over the vocab-parallel student
+        # logits, so every TP rank computes the same w_k^t. The student top-K
+        # gather runs on the live [T, V_local] student logits; teacher gathers
+        # stream chunk-wise from CPU so we never hold a full teacher shard on
+        # GPU just to pick K columns out of it.
+        top_k = min(args.opsd_weight_top_k, V_local * dist.get_world_size(group=tp_group))
+        # Temperature is a positive scalar; it doesn't change top-K indices, so
+        # skip the [T, V_local] copy that `p_student / temp` would allocate.
+        # `mixture_weights` re-applies temperature inside its softmax.
+        _, weight_idx = global_topk(p_student, top_k, shard_start, tp_group)  # [T, K]
+        p_gathered = gather_global_logits(p_student, weight_idx, shard_start, tp_group)
 
-        # §8 — q_mix for this TP rank's vocab shard [T, V_local].  Accumulate in
-        # fp32 for numerical safety (small N weighted softmaxes summing to 1),
-        # then cast to p_student.dtype before passing into KL so every chunk-loop
-        # temporary inside KL/RKL stays bf16 instead of upcasting to fp32 — at
-        # TP=1 / V≈152k / chunk=256 that's the difference between a ~78 MiB and
-        # ~155 MiB temp, and the latter was triggering recurring OOMs.
-        q_mix_local = torch.zeros(T, V_local, dtype=torch.float32, device=device)
+        K_eff = weight_idx.size(-1)
+        q_gathered = p_student.new_empty(len(sel_src), T, K_eff)
         for k, ltsr in enumerate(sel_src):
-            l_gpu = ltsr.to(device, non_blocking=True)
-            w_k = w[k]
-            for t0 in range(0, T, chunk_t):
-                t1 = min(t0 + chunk_t, T)
-                s_full = F.softmax(l_gpu[t0:t1], dim=-1)
-                s_local = s_full[:, shard_start : shard_start + V_local]
-                s_local = s_local * w_k[t0:t1].unsqueeze(-1)
-                q_mix_local[t0:t1].add_(s_local)
-                del s_full, s_local
-            del l_gpu
-        del sel_src, w
-        q_mix_local = q_mix_local.to(p_student.dtype)
+            for t0 in range(0, T, eff_chunk):
+                t1 = min(t0 + eff_chunk, T)
+                l_gpu = ltsr[t0:t1].to(device, non_blocking=True)
+                q_gathered[k, t0:t1] = gather_global_logits(l_gpu, weight_idx[t0:t1], shard_start, tp_group)
+                del l_gpu
+        w, w_entropy_norm = mixture_weights(args, p_gathered, q_gathered)
+        del q_gathered, p_gathered, weight_idx
+        w_detached = w.detach()
+        del w
 
-        # §9 — KL(q_mix ‖ p_θ) via vocab-parallel custom autograd.
-        kl = VocabParallelKLDiv.apply(p_student, q_mix_local.detach(), tp_group, chunk_t, args.opsd_pointwise_kl_clip)
+        # §8 + §9 — KL(q_mix ‖ p_θ) via fused vocab-parallel autograd.
+        # q_mix is reconstructed per chunk inside the Function; pass the teacher
+        # shards as positional args so save_for_backward retains references.
+        kl = VocabParallelMixtureKLDiv.apply(
+            p_student, w_detached, tp_group, eff_chunk, args.opsd_pointwise_kl_clip, *sel_src
+        )
 
         if args.opsd_jsd_token_clip is not None:
             kl = kl.clamp(max=args.opsd_jsd_token_clip)
@@ -864,10 +955,10 @@ def distillation_loss(
         # (α << 1 in ALGO.md Part 1 §9), so this is composed in plugin.py rather
         # than added here.
         if per_token_rkl is not None:
-            rkl = VocabParallelRKLDiv.apply(p_student, q_mix_local.detach(), tp_group, chunk_t)
+            rkl = VocabParallelMixtureRKLDiv.apply(p_student, w_detached, tp_group, eff_chunk, *sel_src)
             per_token_rkl.append(rkl)
 
-        del q_mix_local
+        del sel_src, w_detached
 
         loss_masks = batch.get("loss_masks")
         if loss_masks is not None:
@@ -904,8 +995,8 @@ def distillation_loss(
 
 
 def extract_student_responses(logits: torch.Tensor, args, batch: dict) -> list[torch.Tensor]:
-    # Student logits stay vocab-parallel [T, V_local]; distillation_loss and
-    # VocabParallelKLDiv are designed to operate on them without gathering.
+    # Student logits stay vocab-parallel [T, V_local]; distillation_loss and the
+    # fused mixture autograd ops operate on them without gathering.
     return [
         chunk
         for chunk, _ in get_responses(
