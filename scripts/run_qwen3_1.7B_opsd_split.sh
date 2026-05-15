@@ -110,8 +110,8 @@ OPSD_ARGS=(
    # ── Teacher snapshot ───────────────────────────────────────────────
    --opsd-freeze-teacher                # default; flip to --no-opsd-freeze-teacher for legacy "teacher = current student" mode
 
-   # ── Memory knob (lower → safer; raise on small V/T to reduce launch overhead) ─
-   --opsd-kl-chunk 256                  # token-axis chunk for the vocab-parallel KL/RKL forward+backward
+   # ── Memory knob (lower → safer; raise on small V/T to reduce launch overhead; -1 disables chunking) ─
+   --opsd-kl-chunk 256                  # token-axis chunk for the fused KL/RKL autograd; q_mix is recomputed per chunk (no persistent [T, V_local] buffer)
 )
 
 # Performance & Parallelism — actor side
